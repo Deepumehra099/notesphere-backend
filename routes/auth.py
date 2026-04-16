@@ -39,7 +39,7 @@ def serialize_user(user: dict) -> dict:
         "avatar_url": user.get("avatar_url", ""),
         "bio": user.get("bio", ""),
         "branch": user.get("branch", ""),
-        "semester": user.get("semester", 1),
+        "semester": user.get("semester", int),
     }
 
 

@@ -81,65 +81,49 @@ async def upload_note(
     file: UploadFile = File(...),
     current_user=Depends(get_current_user),
 ):
-    db = get_db()
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+    api_key = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+    api_secret = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+
+    if not cloud_name or not api_key or not api_secret:
+        raise HTTPException(status_code=500, detail="Cloudinary is not configured")
+
+    cloudinary.config(
+        cloud_name=cloud_name,
+        api_key=api_key,
+        api_secret=api_secret,
+        secure=True,
+    )
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files allowed")
 
-    content = await file.read()
     public_id = f"notessphere/notes/{current_user['id']}_{int(datetime.now().timestamp())}"
 
     try:
+        file.file.seek(0)
         result = cloudinary.uploader.upload(
-            content,
+            file.file,
             resource_type="raw",
             public_id=public_id,
             overwrite=True,
-            access_mode="public",
         )
-        file_url = result["secure_url"]
-        logger.info(f"Cloudinary upload success: {file_url}")
+        secure_url = result.get("secure_url")
+        if not secure_url:
+            raise HTTPException(status_code=500, detail="Cloudinary did not return a secure URL")
+        logger.info(f"Cloudinary upload success: {secure_url}")
     except Exception as e:
         logger.error(f"Cloudinary upload failed: {e}")
-        raise HTTPException(status_code=500, detail="File upload failed. Please try again.")
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+    finally:
+        await file.close()
 
-    note_doc = {
-        "title": title,
-        "description": description,
-        "subject": subject,
-        "topic": topic,
-        "file_url": file_url,
-        "file_name": file.filename,
-        "cloudinary_public_id": public_id,
-        "uploaded_by": current_user["id"],
-        "uploader_name": current_user["name"],
-        "uploader_avatar": current_user.get("avatar_url", ""),
-        "status": "pending",
-        "rating": 0.0,
-        "rating_count": 0,
-        "views": 0,
-        "downloads": 0,
-        "unlock_cost": unlock_cost,
-        "unlocked_by": [],
-        "created_at": datetime.now(timezone.utc),
-    }
-    result = await db.notes.insert_one(note_doc)
-
-    # Earn tokens for uploading
-    await db.users.update_one(
-        {"_id": ObjectId(current_user["id"])},
-        {"$inc": {"tokens": 20, "xp": 50}}
-    )
-    await db.transactions.insert_one({
-        "user_id": current_user["id"],
-        "amount": 20,
-        "type": "earn",
-        "reason": f"Uploaded note: {title}",
-        "created_at": datetime.now(timezone.utc),
-    })
-
-    note_doc["id"] = str(result.inserted_id)
-    note_doc.pop("_id", None)
-    return {"note": note_doc, "message": "Note uploaded to Cloudinary, pending approval"}
+    return {"url": secure_url}
 
 @router.post("/{note_id}/unlock")
 async def unlock_note(note_id: str, current_user=Depends(get_current_user)):

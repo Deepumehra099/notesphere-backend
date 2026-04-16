@@ -19,10 +19,7 @@ class ChatMessageInput(BaseModel):
 @router.post("/chat")
 async def ai_chat(data: ChatMessageInput, current_user=Depends(get_current_user)):
     if client is None:
-        return {
-            "response": f"Study helper: {data.message.strip() or 'Please ask a question.'}",
-            "conversation_id": data.conversation_id or str(uuid.uuid4())
-        }
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
     try:
         response = client.chat.completions.create(
@@ -34,17 +31,18 @@ async def ai_chat(data: ChatMessageInput, current_user=Depends(get_current_user)
         )
 
         answer = response.choices[0].message.content
+        if not answer:
+            raise HTTPException(status_code=500, detail="Empty AI response")
 
         return {
             "response": answer,
             "conversation_id": data.conversation_id or str(uuid.uuid4())
         }
 
-    except Exception:
-        return {
-            "response": f"I could not reach the AI service right now. Here is a simple answer starter: {data.message.strip()}",
-            "conversation_id": data.conversation_id or str(uuid.uuid4())
-        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class SummarizeInput(BaseModel):

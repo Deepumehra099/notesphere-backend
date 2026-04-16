@@ -4,7 +4,8 @@ motor
 pymongo
 python-dotenv
 openai
-
+python-multipart
+cloudinary
 
 
 
