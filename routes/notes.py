@@ -49,9 +49,6 @@ def configure_cloudinary() -> None:
         secure=True,
     )
 
-
-configure_cloudinary()
-
 def serialize_note(note):
     n = {**note}
     n["id"] = str(n.pop("_id"))

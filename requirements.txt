@@ -3,10 +3,11 @@ uvicorn[standard]
 motor
 pymongo
 python-dotenv
+bcrypt
+PyJWT
 openai
 python-multipart
 cloudinary
 websockets
-
 
 
