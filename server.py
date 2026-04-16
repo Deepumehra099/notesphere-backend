@@ -7,9 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routes.ai import router as ai_router
 from routes.auth import router as auth_router
-from routes.chat import router as chat_router
+from routes.chat import router as chat_router, ws_router as chat_ws_router
 from routes.notes import router as notes_router
+from routes.search import router as search_router
 from routes.tokens import router as tokens_router
+from routes.user import router as user_router, search_router as user_search_router
 
 load_dotenv()
 
@@ -44,12 +46,16 @@ app.include_router(auth_router)
 app.include_router(notes_router)
 app.include_router(ai_router)
 app.include_router(chat_router)
+app.include_router(chat_ws_router)
 app.include_router(tokens_router)
+app.include_router(search_router)
+app.include_router(user_router)
+app.include_router(user_search_router)
 
 
 @app.get("/")
-def home():
-    return {"message": "Backend working 🚀"}
+def root():
+    return {"status": "running"}
 
 
 @app.get("/api")
@@ -60,3 +66,9 @@ def api():
 @app.get("/api/health")
 def health():
     return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)

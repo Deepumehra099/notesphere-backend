@@ -1,24 +1,56 @@
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+import logging
+import os
 from datetime import datetime, timezone
-from bson import ObjectId
-from utils.db import get_db
-from utils.auth_utils import get_current_user
+from pathlib import Path
 from typing import Optional
+
 import cloudinary
 import cloudinary.uploader
-import os
-import logging
+from bson import ObjectId
+from dotenv import load_dotenv
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+
+from utils.auth_utils import get_current_user
+from utils.db import get_db
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
 logger = logging.getLogger(__name__)
 
-# Configure Cloudinary on module load
-cloudinary.config(
-    cloud_name=os.environ.get("CLOUDINARY_CLOUD_NAME", ""),
-    api_key=os.environ.get("CLOUDINARY_API_KEY", ""),
-    api_secret=os.environ.get("CLOUDINARY_API_SECRET", ""),
-    secure=True,
-)
+def configure_cloudinary() -> None:
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
+    api_key = os.getenv("CLOUDINARY_API_KEY", "").strip()
+    api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip()
+
+    if api_key.startswith("cloudinary://"):
+        logger.error("Invalid Cloudinary configuration: CLOUDINARY_API_KEY contains a cloudinary:// URL")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Invalid Cloudinary configuration. Use plain CLOUDINARY_CLOUD_NAME, "
+                "CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET values."
+            ),
+        )
+
+    if not cloud_name or not api_key or not api_secret:
+        logger.error(
+            "Missing Cloudinary configuration. cloud_name=%s api_key_present=%s api_secret_present=%s",
+            bool(cloud_name),
+            bool(api_key),
+            bool(api_secret),
+        )
+        raise HTTPException(status_code=500, detail="Cloudinary is not configured")
+
+    cloudinary.config(
+        cloud_name=cloud_name,
+        api_key=api_key,
+        api_secret=api_secret,
+        secure=True,
+    )
+
+
+configure_cloudinary()
 
 def serialize_note(note):
     n = {**note}
@@ -81,19 +113,7 @@ async def upload_note(
     file: UploadFile = File(...),
     current_user=Depends(get_current_user),
 ):
-    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
-    api_key = os.environ.get("CLOUDINARY_API_KEY", "").strip()
-    api_secret = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
-
-    if not cloud_name or not api_key or not api_secret:
-        raise HTTPException(status_code=500, detail="Cloudinary is not configured")
-
-    cloudinary.config(
-        cloud_name=cloud_name,
-        api_key=api_key,
-        api_secret=api_secret,
-        secure=True,
-    )
+    configure_cloudinary()
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -101,29 +121,37 @@ async def upload_note(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files allowed")
 
-    public_id = f"notessphere/notes/{current_user['id']}_{int(datetime.now().timestamp())}"
+    public_id = f"notesphere/notes/{current_user['id']}_{int(datetime.now().timestamp())}"
 
     try:
         file.file.seek(0)
         result = cloudinary.uploader.upload(
             file.file,
-            resource_type="raw",
+            resource_type="auto",
             public_id=public_id,
             overwrite=True,
         )
         secure_url = result.get("secure_url")
         if not secure_url:
             raise HTTPException(status_code=500, detail="Cloudinary did not return a secure URL")
-        logger.info(f"Cloudinary upload success: {secure_url}")
+        logger.info(
+            "Cloudinary upload success. user_id=%s filename=%s file_url=%s",
+            current_user["id"],
+            file.filename,
+            secure_url,
+        )
     except Exception as e:
-        logger.error(f"Cloudinary upload failed: {e}")
         if isinstance(e, HTTPException):
             raise e
-        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+        logger.exception("Cloudinary upload failed for filename=%s: %s", file.filename, e)
+        raise HTTPException(status_code=500, detail="File upload failed")
     finally:
         await file.close()
 
-    return {"url": secure_url}
+    return {
+        "message": "Upload successful",
+        "file_url": secure_url,
+    }
 
 @router.post("/{note_id}/unlock")
 async def unlock_note(note_id: str, current_user=Depends(get_current_user)):

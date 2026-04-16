@@ -1,5 +1,8 @@
+import secrets
+import string
 from datetime import datetime, timezone
 
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -28,19 +31,43 @@ class LoginInput(BaseModel):
 
 
 def serialize_user(user: dict) -> dict:
+    avatar_url = user.get("avatar_url") or user.get("avatar", "")
     return {
-        "id": str(user["_id"]),
+        "id": str(user.get("_id", user.get("id", ""))),
+        "uid": user.get("uid", ""),
         "name": user.get("name", ""),
         "email": user.get("email", ""),
         "role": user.get("role", "user"),
         "tokens": user.get("tokens", 0),
         "xp": user.get("xp", 0),
         "streak": user.get("streak", 0),
-        "avatar_url": user.get("avatar_url", ""),
+        "avatar": avatar_url,
+        "avatar_url": avatar_url,
         "bio": user.get("bio", ""),
         "branch": user.get("branch", ""),
-        "semester": user.get("semester", int),
+        "semester": user.get("semester", 1),
     }
+
+
+async def generate_unique_uid(users_collection) -> str:
+    alphabet = string.digits
+
+    for _ in range(12):
+        candidate = f"NS{''.join(secrets.choice(alphabet) for _ in range(5))}"
+        if not await users_collection.find_one({"uid": candidate}, {"_id": 1}):
+            return candidate
+
+    raise HTTPException(status_code=500, detail="Unable to generate user UID")
+
+
+async def ensure_user_uid(users_collection, user: dict) -> dict:
+    if user.get("uid"):
+        return user
+
+    uid = await generate_unique_uid(users_collection)
+    await users_collection.update_one({"_id": user["_id"]}, {"$set": {"uid": uid}})
+    user["uid"] = uid
+    return user
 
 
 @router.post("/register")
@@ -54,6 +81,7 @@ async def register(data: RegisterInput):
         raise HTTPException(status_code=400, detail="Email already exists")
 
     user_doc = {
+        "uid": await generate_unique_uid(users),
         "name": data.name.strip(),
         "email": email,
         "password_hash": hash_password(data.password),
@@ -61,6 +89,7 @@ async def register(data: RegisterInput):
         "tokens": 100,
         "xp": 0,
         "streak": 0,
+        "avatar": "",
         "avatar_url": "",
         "bio": "",
         "branch": data.branch.strip() if data.branch else "",
@@ -95,6 +124,8 @@ async def login(data: LoginInput):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
+    user = await ensure_user_uid(users, user)
+
     password_hash = user.get("password_hash")
     password_matches = (
         verify_password(data.password, password_hash)
@@ -122,4 +153,11 @@ async def login(data: LoginInput):
 
 @router.get("/me")
 async def get_me(current_user=Depends(get_current_user)):
-    return {"user": current_user}
+    db = get_db()
+    users = db["users"]
+    user_record = await users.find_one({"_id": ObjectId(current_user["id"])})
+    if not user_record:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user_record = await ensure_user_uid(users, user_record)
+    return {"user": serialize_user(user_record)}

@@ -1,5 +1,8 @@
 {
   "dependencies": {
+    "@react-native-async-storage/async-storage": "2.2.0",
+    "expo-image-picker": "^55.0.18",
+    "expo-router": "~55.0.12",
     "mongoose": "^9.4.1"
   }
 }
