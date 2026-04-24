@@ -1,8 +1,22 @@
 {
+  "name": "noteverse-backend",
+  "version": "1.0.0",
+  "description": "Production-ready NoteVerse API",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js"
+  },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
-    "expo-image-picker": "^55.0.18",
-    "expo-router": "~55.0.12",
-    "mongoose": "^9.4.1"
+    "bcrypt": "^6.0.0",
+    "cloudinary": "^2.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.4.1",
+    "morgan": "^1.10.0",
+    "multer": "^2.0.2",
+    "razorpay": "^2.9.6"
   }
 }

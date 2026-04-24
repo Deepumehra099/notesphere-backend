@@ -37,6 +37,7 @@ uploaded_note_id = None
 uploaded_file_url = None
 test_chat_id = None
 ai_conversation_id = None
+payment_configured = bool(os.environ.get("RAZORPAY_KEY_ID") and os.environ.get("RAZORPAY_KEY_SECRET"))
 
 
 class TestAuth:

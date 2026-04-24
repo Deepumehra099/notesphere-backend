@@ -1,5 +1,7 @@
 import logging
 import os
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -8,17 +10,42 @@ import cloudinary.uploader
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 
 from routes.auth import serialize_user
-from utils.auth_utils import get_current_user
+from utils.auth_utils import get_current_user, hash_password
 from utils.db import get_db
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
+UPLOADS_DIR = Path(__file__).resolve().parents[1] / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 router = APIRouter(prefix="/api/user", tags=["user"])
 search_router = APIRouter(prefix="/api/users", tags=["user"])
 logger = logging.getLogger(__name__)
+
+
+class ReportUserInput(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class BlockUserInput(BaseModel):
+    user_id: str = Field(..., min_length=1)
+
+
+def parse_skills_input(raw_value: str) -> list[str]:
+    seen: set[str] = set()
+    skills: list[str] = []
+    for part in raw_value.split(","):
+        skill = part.strip()
+        normalized = skill.lower()
+        if not skill or normalized in seen:
+            continue
+        seen.add(normalized)
+        skills.append(skill)
+    return skills
 
 
 def configure_cloudinary() -> None:
@@ -101,15 +128,36 @@ async def search_user_by_uid_alias(
 @router.put("/profile")
 async def update_profile(
     name: str = Form(...),
+    email: str = Form(""),
+    phone: str = Form(""),
     bio: str = Form(""),
+    location: str = Form(""),
+    language: str = Form("en"),
+    skills: str = Form(""),
+    password: str = Form(""),
     avatar: Optional[UploadFile] = File(None),
     current_user=Depends(get_current_user),
 ):
     clean_name = name.strip()
+    clean_email = email.strip().lower()
+    clean_phone = phone.strip()
     clean_bio = bio.strip()
+    clean_location = location.strip()
+    clean_language = (language.strip().lower() or "en")
+    clean_skills = parse_skills_input(skills)
+    clean_password = password.strip()
 
     if not clean_name:
         raise HTTPException(status_code=400, detail="Name is required")
+
+    if not clean_email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    if clean_password and len(clean_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    if clean_language not in {"en", "hi"}:
+        raise HTTPException(status_code=400, detail="Language must be en or hi")
 
     avatar_url = current_user.get("avatar_url") or current_user.get("avatar", "")
 
@@ -146,16 +194,33 @@ async def update_profile(
             await avatar.close()
 
     db = get_db()
+    existing_user = await db.users.find_one(
+        {
+            "email": clean_email,
+            "_id": {"$ne": ObjectId(current_user["id"])},
+        },
+        {"_id": 1},
+    )
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    updates = {
+        "name": clean_name,
+        "email": clean_email,
+        "phone": clean_phone,
+        "bio": clean_bio,
+        "location": clean_location,
+        "language": clean_language,
+        "skills": clean_skills,
+        "avatar": avatar_url,
+        "avatar_url": avatar_url,
+    }
+    if clean_password:
+        updates["password_hash"] = hash_password(clean_password)
+
     updated_user = await db.users.find_one_and_update(
         {"_id": ObjectId(current_user["id"])},
-        {
-            "$set": {
-                "name": clean_name,
-                "bio": clean_bio,
-                "avatar": avatar_url,
-                "avatar_url": avatar_url,
-            }
-        },
+        {"$set": updates},
         return_document=ReturnDocument.AFTER,
     )
 
@@ -164,3 +229,166 @@ async def update_profile(
 
     logger.info("Profile updated successfully for user_id=%s", current_user["id"])
     return {"user": serialize_user(updated_user)}
+
+
+@router.post("/upload-avatar")
+async def upload_avatar(
+    avatar: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+):
+    if not avatar.filename:
+        raise HTTPException(status_code=400, detail="Avatar file is required")
+
+    content_type = (avatar.content_type or "").lower()
+    if content_type and not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Avatar must be an image")
+
+    file_ext = Path(avatar.filename).suffix or ".jpg"
+    filename = f"avatar_{current_user['id']}_{int(datetime.utcnow().timestamp())}{file_ext}"
+    destination = UPLOADS_DIR / filename
+
+    try:
+        with destination.open("wb") as buffer:
+            shutil.copyfileobj(avatar.file, buffer)
+    finally:
+        await avatar.close()
+
+    avatar_url = f"/uploads/{filename}"
+    db = get_db()
+    updated_user = await db.users.find_one_and_update(
+        {"_id": ObjectId(current_user["id"])},
+        {"$set": {"avatar": avatar_url, "avatar_url": avatar_url}},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if not updated_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "message": "Avatar uploaded successfully",
+        "avatar": avatar_url,
+        "user": serialize_user(updated_user),
+    }
+
+
+@router.put("/update")
+async def update_profile_alias(
+    name: str = Form(...),
+    email: str = Form(""),
+    phone: str = Form(""),
+    bio: str = Form(""),
+    location: str = Form(""),
+    language: str = Form("en"),
+    skills: str = Form(""),
+    password: str = Form(""),
+    avatar: Optional[UploadFile] = File(None),
+    current_user=Depends(get_current_user),
+):
+    return await update_profile(
+        name=name,
+        email=email,
+        phone=phone,
+        bio=bio,
+        location=location,
+        language=language,
+        skills=skills,
+        password=password,
+        avatar=avatar,
+        current_user=current_user,
+    )
+
+
+@router.post("/update-profile")
+async def update_profile_post_alias(
+    name: str = Form(...),
+    email: str = Form(""),
+    phone: str = Form(""),
+    bio: str = Form(""),
+    location: str = Form(""),
+    language: str = Form("en"),
+    skills: str = Form(""),
+    password: str = Form(""),
+    avatar: Optional[UploadFile] = File(None),
+    current_user=Depends(get_current_user),
+):
+    return await update_profile(
+        name=name,
+        email=email,
+        phone=phone,
+        bio=bio,
+        location=location,
+        language=language,
+        skills=skills,
+        password=password,
+        avatar=avatar,
+        current_user=current_user,
+    )
+
+
+class LanguageInput(BaseModel):
+    language: str = Field(..., pattern="^(en|hi)$")
+
+
+@router.put("/language")
+async def update_language(data: LanguageInput, current_user=Depends(get_current_user)):
+    db = get_db()
+    updated_user = await db.users.find_one_and_update(
+        {"_id": ObjectId(current_user["id"])},
+        {"$set": {"language": data.language}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"message": "Language updated", "user": serialize_user(updated_user)}
+
+
+@router.post("/report")
+async def report_user(data: ReportUserInput, current_user=Depends(get_current_user)):
+    db = get_db()
+    if data.user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You cannot report yourself")
+
+    try:
+        target_object_id = ObjectId(data.user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="User not found") from exc
+
+    target_user = await db.users.find_one({"_id": target_object_id}, {"name": 1})
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    clean_reason = data.reason.strip()
+    report_doc = {
+        "type": "user",
+        "reported_id": data.user_id,
+        "reported_name": target_user.get("name", "User"),
+        "reported_by": current_user["id"],
+        "reported_by_name": current_user.get("name", "Student"),
+        "reason": clean_reason,
+        "created_at": datetime.utcnow(),
+        "status": "open",
+    }
+    await db.reports.insert_one(report_doc)
+    return {"message": "User reported successfully"}
+
+
+@router.post("/block")
+async def block_user(data: BlockUserInput, current_user=Depends(get_current_user)):
+    db = get_db()
+    if data.user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You cannot block yourself")
+
+    try:
+        target_object_id = ObjectId(data.user_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="User not found") from exc
+
+    target_user = await db.users.find_one({"_id": target_object_id}, {"name": 1})
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await db.users.update_one(
+        {"_id": ObjectId(current_user["id"])},
+        {"$addToSet": {"blocked_user_ids": data.user_id}},
+    )
+    return {"message": f"{target_user.get('name', 'User')} has been blocked"}
