@@ -1,8 +1,22 @@
 const express = require("express");
 const { verifyToken } = require("../middleware/auth");
-const { WALLET_PACKAGES, createDepositOrder, verifyDepositPayment } = require("../services/paymentService");
+const {
+  WALLET_PACKAGES,
+  createDepositOrder,
+  handleRazorpayWebhook,
+  verifyDepositPayment,
+} = require("../services/paymentService");
 
 const router = express.Router();
+
+router.post("/webhook", async (req, res) => {
+  const result = await handleRazorpayWebhook({
+    rawBody: req.rawBody,
+    signature: String(req.headers["x-razorpay-signature"] || ""),
+    event: req.body,
+  });
+  return res.json({ message: "Webhook received", ...result });
+});
 
 router.get("/packages", verifyToken, async (_req, res) => {
   return res.json({ packages: WALLET_PACKAGES });
@@ -27,12 +41,18 @@ router.post("/verify", verifyToken, async (req, res) => {
     return res.status(400).json({ message: "order_id is required" });
   }
 
-  const { paymentOrder, wallet, transaction } = await verifyDepositPayment({ orderId, paymentId, signature });
+  const { paymentOrder, wallet, transaction, alreadyPaid } = await verifyDepositPayment({
+    orderId,
+    paymentId,
+    signature,
+    userId: req.user._id,
+  });
   return res.json({
-    message: "Payment verified successfully",
+    message: alreadyPaid ? "Payment was already verified" : "Payment verified successfully",
     wallet,
     transaction,
     paymentOrderId: paymentOrder._id.toString(),
+    status: paymentOrder.status,
   });
 });
 

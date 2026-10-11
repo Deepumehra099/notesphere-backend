@@ -2,9 +2,44 @@ const express = require("express");
 const { verifyToken } = require("../middleware/auth");
 const { rateLimit } = require("../middleware/rateLimit");
 const Transaction = require("../models/Transaction");
+const Withdrawal = require("../models/Withdrawal");
 const { buildWalletResponse, ensureWallet, requestWithdrawal } = require("../services/walletService");
 
 const router = express.Router();
+
+async function getWalletActivitySummary(userId) {
+  const [summary] = await Transaction.aggregate([
+    { $match: { userId, status: "completed" } },
+    {
+      $group: {
+        _id: null,
+        totalDeposited: {
+          $sum: {
+            $cond: [
+              { $and: [{ $eq: ["$type", "credit"] }, { $eq: ["$source", "deposit"] }] },
+              "$amount",
+              0,
+            ],
+          },
+        },
+        totalWithdrawn: {
+          $sum: {
+            $cond: [
+              { $and: [{ $eq: ["$type", "debit"] }, { $eq: ["$source", "withdraw"] }] },
+              "$amount",
+              0,
+            ],
+          },
+        },
+      },
+    },
+  ]);
+
+  return {
+    totalDeposited: summary?.totalDeposited || 0,
+    totalWithdrawn: summary?.totalWithdrawn || 0,
+  };
+}
 
 function parseAmount(value) {
   const amount = Number(value);
@@ -13,12 +48,14 @@ function parseAmount(value) {
 
 router.get("/", verifyToken, async (req, res) => {
   const wallet = await ensureWallet(req.user._id);
-  return res.json(buildWalletResponse(wallet));
+  const activitySummary = await getWalletActivitySummary(req.user._id);
+  return res.json({ ...buildWalletResponse(wallet), ...activitySummary });
 });
 
 router.get("/wallet", verifyToken, async (req, res) => {
   const wallet = await ensureWallet(req.user._id);
-  return res.json(buildWalletResponse(wallet));
+  const activitySummary = await getWalletActivitySummary(req.user._id);
+  return res.json({ ...buildWalletResponse(wallet), ...activitySummary });
 });
 
 router.get("/transactions", verifyToken, async (req, res) => {
@@ -38,7 +75,8 @@ router.get("/transactions", verifyToken, async (req, res) => {
       source: item.source,
       category: item.category,
       amount: item.amount,
-      status: item.status,
+      status: item.status === "held" ? "Held" : item.status,
+      activity_category: item.source === "deposit" ? "deposits" : item.source === "withdraw" ? "withdrawals" : item.source === "refund" ? "refunds" : item.category === "earning" ? "earnings" : "purchases",
       title: item.title,
       referenceId: item.referenceId,
       metadata: item.metadata || {},
@@ -51,6 +89,25 @@ router.get("/transactions", verifyToken, async (req, res) => {
       total,
       hasMore: skip + items.length < total,
     },
+  });
+});
+
+router.get("/withdrawals", verifyToken, async (req, res) => {
+  const items = await Withdrawal.find({ userId: req.user._id }).sort({ createdAt: -1 });
+  return res.json({
+    requests: items.map((item) => ({
+      id: item._id.toString(),
+      amount: item.amount,
+      method: item.method,
+      accountLabel: item.accountLabel,
+      accountRef: item.accountRef,
+      referenceId: item.referenceId,
+      status: item.status === "completing" ? "processing" : item.status === "approved" ? "completed" : item.status,
+      adminRemark: item.adminRemark,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      metadata: item.metadata || {},
+    })),
   });
 });
 
@@ -67,7 +124,7 @@ router.post(
     }
 
     if (amount < 100) {
-      return res.status(400).json({ message: "Minimum withdrawal is 100 tokens" });
+      return res.status(400).json({ message: "Minimum withdrawal is ₹100" });
     }
 
     if (!upiId) {

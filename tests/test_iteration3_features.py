@@ -125,26 +125,13 @@ class TestNoteUpload:
         if not uploaded_note_id or not admin_token:
             pytest.skip("No uploaded note or admin token")
         
-        # Directly update DB to approve (no admin approve endpoint in routes)
-        import sys
-        sys.path.insert(0, '/app/backend')
-        from dotenv import load_dotenv
-        from pathlib import Path
-        load_dotenv(Path('/app/backend/.env'))
-        
-        from utils.db import get_db
-        from bson import ObjectId
-        import asyncio
-        
-        async def approve():
-            db = get_db()
-            await db.notes.update_one(
-                {"_id": ObjectId(uploaded_note_id)},
-                {"$set": {"status": "approved"}}
-            )
-        
-        asyncio.run(approve())
-        print(f"✓ Note {uploaded_note_id} approved")
+        response = requests.post(
+            f"{BASE_URL}/api/admin/notes/{uploaded_note_id}/approve",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert response.status_code == 200, f"Approval failed: {response.text}"
+        assert response.json().get("credits_rewarded", 0) >= 0
+        print(f"✓ Note {uploaded_note_id} approved through admin API")
 
 
 class TestNoteUnlock:
@@ -157,11 +144,11 @@ class TestNoteUnlock:
             pytest.skip("Student token not available")
         
         headers = {"Authorization": f"Bearer {student_token}"}
-        response = requests.get(f"{BASE_URL}/api/tokens/wallet", headers=headers)
+        response = requests.get(f"{BASE_URL}/api/credits/balance", headers=headers)
         assert response.status_code == 200
         data = response.json()
-        student_initial_balance = data["tokens"]
-        print(f"✓ Student initial balance: {student_initial_balance} tokens")
+        student_initial_balance = data["balance"]
+        print(f"✓ Student initial balance: {student_initial_balance} Credits")
 
     def test_unlock_note_deducts_tokens(self):
         """Test POST /api/notes/{id}/unlock deducts tokens from buyer"""
@@ -169,6 +156,8 @@ class TestNoteUnlock:
             pytest.skip("No uploaded note or student token")
         
         headers = {"Authorization": f"Bearer {student_token}"}
+        if student_initial_balance < 15:
+            pytest.skip("Seeded student has insufficient Credits for the 15 Credit note")
         response = requests.post(f"{BASE_URL}/api/notes/{uploaded_note_id}/unlock", headers=headers)
         assert response.status_code == 200, f"Unlock failed: {response.text}"
         
@@ -176,16 +165,16 @@ class TestNoteUnlock:
         assert "message" in data
         print(f"✓ Note unlocked: {data['message']}")
         
-        # Verify tokens deducted
-        wallet_response = requests.get(f"{BASE_URL}/api/tokens/wallet", headers=headers)
+        # Verify Credits were deducted while the real-money wallet stayed untouched.
+        wallet_response = requests.get(f"{BASE_URL}/api/credits/balance", headers=headers)
         assert wallet_response.status_code == 200
         wallet_data = wallet_response.json()
-        new_balance = wallet_data["tokens"]
+        new_balance = wallet_data["balance"]
         
         # Should have deducted 15 tokens (unlock_cost)
         expected_balance = student_initial_balance - 15
         assert new_balance == expected_balance, f"Expected {expected_balance} tokens, got {new_balance}"
-        print(f"✓ Tokens deducted: {student_initial_balance} → {new_balance} (-15)")
+        print(f"✓ Credits deducted: {student_initial_balance} → {new_balance} (-15)")
 
     def test_unlock_already_unlocked(self):
         """Test unlocking already unlocked note returns message"""

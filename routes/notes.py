@@ -3,45 +3,41 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 import cloudinary
 import cloudinary.uploader
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pymongo import ReturnDocument
 
 from utils.auth_utils import get_current_user
-from utils.db import get_db
-from utils.wallets import ensure_wallet, hold_wallet_funds, release_held_funds
+from utils.db import get_client, get_db
+from utils.credits import InsufficientCredits, apply_credit_change, qualify_referral
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
 logger = logging.getLogger(__name__)
+UPLOADS_ROOT = Path(__file__).resolve().parents[1] / "uploads"
+NOTES_UPLOADS_DIR = UPLOADS_ROOT / "notes"
+THUMBNAILS_UPLOADS_DIR = UPLOADS_ROOT / "note-thumbnails"
+NOTES_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+THUMBNAILS_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-def configure_cloudinary() -> None:
+def configure_cloudinary() -> bool:
     cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
     api_key = os.getenv("CLOUDINARY_API_KEY", "").strip()
     api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip()
 
     if api_key.startswith("cloudinary://"):
-        logger.error("Invalid Cloudinary configuration: CLOUDINARY_API_KEY contains a cloudinary:// URL")
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Invalid Cloudinary configuration. Use plain CLOUDINARY_CLOUD_NAME, "
-                "CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET values."
-            ),
-        )
+        logger.warning("Invalid Cloudinary configuration detected, falling back to local uploads")
+        return False
 
     if not cloud_name or not api_key or not api_secret:
-        logger.error(
-            "Missing Cloudinary configuration. cloud_name=%s api_key_present=%s api_secret_present=%s",
-            bool(cloud_name),
-            bool(api_key),
-            bool(api_secret),
-        )
-        raise HTTPException(status_code=500, detail="Cloudinary is not configured")
+        logger.warning("Cloudinary config missing, falling back to local uploads")
+        return False
 
     cloudinary.config(
         cloud_name=cloud_name,
@@ -49,13 +45,37 @@ def configure_cloudinary() -> None:
         api_secret=api_secret,
         secure=True,
     )
+    return True
 
-def serialize_note(note):
+async def save_upload_locally(upload: UploadFile, directory: Path, prefix: str) -> str:
+    original_name = upload.filename or f"{prefix}.bin"
+    suffix = Path(original_name).suffix or ""
+    safe_name = f"{prefix}_{uuid4().hex}{suffix}"
+    destination = directory / safe_name
+    upload.file.seek(0)
+    with destination.open("wb") as output:
+        while True:
+            chunk = upload.file.read(1024 * 1024)
+            if not chunk:
+                break
+            output.write(chunk)
+    return f"/uploads/{directory.name}/{safe_name}"
+
+def serialize_note(note, viewer_id: str | None = None):
     n = {**note}
     n["id"] = str(n.pop("_id"))
     price = n.get("unlock_cost", 0) or 0
     n["price"] = price
     n["access_type"] = "paid" if price > 0 else "free"
+    unlocked_by = {str(uid) for uid in n.get("unlocked_by", [])}
+    has_access = (
+        price <= 0
+        or str(n.get("uploaded_by", "")) == str(viewer_id or "")
+        or str(viewer_id or "") in unlocked_by
+    )
+    if not has_access:
+        n["file_url"] = ""
+        n["pdf_url"] = ""
     if "unlocked_by" in n:
         n["unlocked_by"] = [str(uid) for uid in n.get("unlocked_by", [])]
     return n
@@ -80,7 +100,7 @@ async def get_notes_feed(
     cursor = db.notes.find(query).sort(s[0], s[1]).skip(skip).limit(limit)
     notes = []
     async for note in cursor:
-        n = serialize_note(note)
+        n = serialize_note(note, current_user["id"])
         n["is_unlocked"] = (
             n.get("price", 0) <= 0
             or current_user["id"] in n.get("unlocked_by", [])
@@ -115,7 +135,7 @@ async def get_notes_feed_compat(
     cursor = db.notes.find(query).sort("created_at", -1).skip(skip).limit(limit)
     notes = []
     async for note in cursor:
-        n = serialize_note(note)
+        n = serialize_note(note, current_user["id"])
         n["is_unlocked"] = (
             n.get("price", 0) <= 0
             or current_user["id"] in n.get("unlocked_by", [])
@@ -133,7 +153,19 @@ async def get_my_notes(current_user=Depends(get_current_user)):
     cursor = db.notes.find({"uploaded_by": current_user["id"]}).sort("created_at", -1)
     notes = []
     async for note in cursor:
-        notes.append(serialize_note(note))
+        notes.append(serialize_note(note, current_user["id"]))
+    return {"notes": notes}
+
+
+@router.get("/purchased")
+async def get_purchased_notes(current_user=Depends(get_current_user)):
+    db = get_db()
+    cursor = db.notes.find({"status": "approved", "unlock_cost": {"$gt": 0}, "unlocked_by": current_user["id"]}).sort("created_at", -1).limit(100)
+    notes = []
+    async for note in cursor:
+        item = serialize_note(note, current_user["id"])
+        item["is_unlocked"] = True
+        notes.append(item)
     return {"notes": notes}
 
 @router.get("/{note_id}")
@@ -143,7 +175,7 @@ async def get_note(note_id: str, current_user=Depends(get_current_user)):
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
     await db.notes.update_one({"_id": ObjectId(note_id)}, {"$inc": {"views": 1}})
-    n = serialize_note(note)
+    n = serialize_note(note, current_user["id"])
     n["is_unlocked"] = (
         n.get("price", 0) <= 0
         or current_user["id"] in n.get("unlocked_by", [])
@@ -158,14 +190,21 @@ async def upload_note(
     subject: str = Form(...),
     topic: str = Form(""),
     tags: str = Form(""),
-    unlock_cost: int = Form(0),
-    price: Optional[int] = Form(None),
+    unlock_cost: Optional[str] = Form(None),
+    price: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     pdf: Optional[UploadFile] = File(None),
     thumbnail: Optional[UploadFile] = File(None),
     current_user=Depends(get_current_user),
 ):
-    configure_cloudinary()
+    clean_title = (title or "").strip()
+    clean_subject = (subject or "").strip()
+    clean_topic = (topic or "").strip()
+
+    if not clean_title:
+        raise HTTPException(status_code=400, detail="Title is required")
+    if not clean_subject:
+        raise HTTPException(status_code=400, detail="Subject is required")
 
     actual_file = pdf or file
     if actual_file is None or not actual_file.filename:
@@ -174,42 +213,59 @@ async def upload_note(
     if not actual_file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files allowed")
 
-    final_price = max(0, int(price if price is not None else unlock_cost or 0))
+    raw_price = price if price not in (None, "") else unlock_cost
+    if raw_price in (None, ""):
+        from utils.credits import get_credit_settings
+        raw_price = (await get_credit_settings(db)).get("premium_note_price", 0)
+    try:
+        final_price = max(0, int(raw_price or 0))
+    except (TypeError, ValueError):
+        final_price = 0
     thumbnail_url = ""
 
     public_id = f"notesphere/notes/{current_user['id']}_{int(datetime.now().timestamp())}"
 
     try:
-        actual_file.file.seek(0)
-        result = cloudinary.uploader.upload(
-            actual_file.file,
-            resource_type="auto",
-            public_id=public_id,
-            overwrite=True,
-        )
-        secure_url = result.get("secure_url")
-        if not secure_url:
-            raise HTTPException(status_code=500, detail="Cloudinary did not return a secure URL")
-        logger.info(
-            "Cloudinary upload success. user_id=%s filename=%s file_url=%s",
-            current_user["id"],
-            actual_file.filename,
-            secure_url,
-        )
-
-        if thumbnail is not None and thumbnail.filename:
-            thumbnail.file.seek(0)
-            thumbnail_result = cloudinary.uploader.upload(
-                thumbnail.file,
-                resource_type="image",
-                folder="notesphere/note-thumbnails",
+        cloudinary_ready = configure_cloudinary()
+        if cloudinary_ready:
+            actual_file.file.seek(0)
+            result = cloudinary.uploader.upload(
+                actual_file.file,
+                resource_type="auto",
+                public_id=public_id,
+                overwrite=True,
             )
-            thumbnail_url = thumbnail_result.get("secure_url", "").strip()
+            secure_url = result.get("secure_url")
+            if not secure_url:
+                raise RuntimeError("Cloudinary did not return secure_url")
+            logger.info(
+                "Cloudinary upload success. user_id=%s filename=%s file_url=%s",
+                current_user["id"],
+                actual_file.filename,
+                secure_url,
+            )
+
+            if thumbnail is not None and thumbnail.filename:
+                thumbnail.file.seek(0)
+                thumbnail_result = cloudinary.uploader.upload(
+                    thumbnail.file,
+                    resource_type="image",
+                    folder="notesphere/note-thumbnails",
+                )
+                thumbnail_url = thumbnail_result.get("secure_url", "").strip()
+        else:
+            secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
+            if thumbnail is not None and thumbnail.filename:
+                thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
     except Exception as e:
-        if isinstance(e, HTTPException):
-            raise e
-        logger.exception("Cloudinary upload failed for filename=%s: %s", actual_file.filename, e)
-        raise HTTPException(status_code=500, detail="File upload failed")
+        logger.exception("Primary upload failed for filename=%s: %s. Falling back to local storage.", actual_file.filename, e)
+        try:
+            secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
+            if thumbnail is not None and thumbnail.filename and not thumbnail_url:
+                thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
+        except Exception:
+            logger.exception("Local upload fallback also failed for filename=%s", actual_file.filename)
+            raise HTTPException(status_code=500, detail="File upload failed")
     finally:
         await actual_file.close()
         if thumbnail is not None:
@@ -217,10 +273,10 @@ async def upload_note(
 
     db = get_db()
     note_doc = {
-        "title": title.strip(),
+        "title": clean_title,
         "description": description.strip(),
-        "subject": subject.strip(),
-        "topic": topic.strip(),
+        "subject": clean_subject,
+        "topic": clean_topic,
         "unlock_cost": final_price,
         "price": final_price,
         "status": "pending",
@@ -245,7 +301,7 @@ async def upload_note(
     return {
         "message": "Upload successful",
         "file_url": secure_url,
-        "note": serialize_note(note_doc),
+        "note": serialize_note(note_doc, current_user["id"]),
     }
 
 
@@ -256,8 +312,8 @@ async def upload_note_alias(
     subject: str = Form(...),
     topic: str = Form(""),
     tags: str = Form(""),
-    unlock_cost: int = Form(0),
-    price: Optional[int] = Form(None),
+    unlock_cost: Optional[str] = Form("0"),
+    price: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     pdf: Optional[UploadFile] = File(None),
     thumbnail: Optional[UploadFile] = File(None),
@@ -280,52 +336,52 @@ async def upload_note_alias(
 @router.post("/{note_id}/unlock")
 async def unlock_note(note_id: str, current_user=Depends(get_current_user)):
     db = get_db()
-    note = await db.notes.find_one({"_id": ObjectId(note_id)})
+    try:
+        note_object_id = ObjectId(note_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Note not found") from exc
+    note = await db.notes.find_one({"_id": note_object_id})
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
-    if current_user["id"] in [str(uid) for uid in note.get("unlocked_by", [])]:
-        return {"message": "Already unlocked"}
     if note.get("uploaded_by") == current_user["id"]:
         return {"message": "You own this note"}
-    cost = note.get("unlock_cost", 10)
+    unlocked_by = [str(uid) for uid in note.get("unlocked_by", [])]
+    if current_user["id"] in unlocked_by:
+        return {"message": "Already unlocked", "alreadyUnlocked": True}
+    if note.get("status") != "approved":
+        raise HTTPException(status_code=409, detail="This note is not available for purchase yet")
+    cost = max(0, int(note.get("unlock_cost", 0) or 0))
     if cost <= 0:
-        return {"message": "Free note already accessible"}
-    buyer_wallet = await ensure_wallet(db, current_user["id"])
-    if int(buyer_wallet.get("available_balance", 0) or 0) < cost:
-        raise HTTPException(status_code=400, detail="Not enough wallet balance")
-    held_wallet = await hold_wallet_funds(
-        db,
-        user_id=current_user["id"],
-        amount=cost,
-        reason=f"Funds held for note unlock: {note['title']}",
-        source_type="note",
-        source_id=note_id,
-        counterparty_user_id=note["uploaded_by"],
-        metadata={"note_title": note["title"]},
-    )
-    if not held_wallet:
-        raise HTTPException(status_code=400, detail="Not enough wallet balance")
+        return {"message": "Free note already accessible", "alreadyUnlocked": True}
 
-    settlement = await release_held_funds(
-        db,
-        buyer_user_id=current_user["id"],
-        seller_user_id=note["uploaded_by"],
-        amount=cost,
-        reason=f"Marketplace sale completed: {note['title']}",
-        source_type="note",
-        source_id=note_id,
-        metadata={"note_title": note["title"]},
-    )
-    # Add to unlocked list
-    await db.notes.update_one(
-        {"_id": ObjectId(note_id)},
-        {"$push": {"unlocked_by": current_user["id"]}}
-    )
-    return {
-        "message": "Note unlocked successfully",
-        "seller_payout": settlement["seller_payout"],
-        "commission_amount": settlement["commission_amount"],
-    }
+    client = get_client()
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                updated_note = await db.notes.find_one_and_update(
+                    {"_id": note_object_id, "status": "approved", "unlocked_by": {"$ne": current_user["id"]}},
+                    {"$addToSet": {"unlocked_by": current_user["id"]}, "$inc": {"credit_purchase_sequence": 1}},
+                    return_document=ReturnDocument.AFTER,
+                    session=session,
+                )
+                if not updated_note:
+                    raise HTTPException(status_code=409, detail="Note is already unlocked or unavailable")
+                sequence = int(updated_note.get("credit_purchase_sequence", 1) or 1)
+                result = await apply_credit_change(
+                    db,
+                    user_id=current_user["id"],
+                    amount=-cost,
+                    transaction_type="CREDIT_SPEND",
+                    description=f"Premium note unlock: {note.get('title', 'Note')}",
+                    idempotency_key=f"note-purchase:{current_user['id']}:{note_id}:{sequence}",
+                    reference_id=note_id,
+                    metadata={"note_title": note.get("title", ""), "purchase_sequence": sequence, "price_credits": cost},
+                    session=session,
+                )
+                await qualify_referral(db, current_user["id"], session=session)
+    except InsufficientCredits as exc:
+        raise HTTPException(status_code=400, detail="Not enough Tokens") from exc
+    return {"message": "Note unlocked successfully", "tokens_spent": cost, "tokens_balance": result["balance"]}
 
 
 @router.post("/buy")

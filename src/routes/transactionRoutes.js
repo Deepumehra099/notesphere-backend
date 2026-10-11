@@ -9,10 +9,24 @@ router.get("/", verifyToken, async (req, res) => {
   const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 10));
   const skip = (page - 1) * limit;
   const category = String(req.query.category || "").trim();
+  const type = String(req.query.type || "").trim();
+  const date = String(req.query.date || "").trim();
   const query = { userId: req.user._id };
 
   if (category) {
     query.category = category;
+  }
+
+  if (type && ["credit", "debit"].includes(type)) {
+    query.type = type;
+  }
+
+  if (date) {
+    const start = new Date(`${date}T00:00:00.000Z`);
+    const end = new Date(`${date}T23:59:59.999Z`);
+    if (!Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime())) {
+      query.createdAt = { $gte: start, $lte: end };
+    }
   }
 
   const [items, total] = await Promise.all([

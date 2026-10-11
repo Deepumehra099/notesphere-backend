@@ -1,11 +1,16 @@
 import os
 import secrets
 import string
+import hashlib
+import hmac
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from pymongo.errors import DuplicateKeyError
 
 from utils.auth_utils import (
     create_access_token,
@@ -13,8 +18,9 @@ from utils.auth_utils import (
     hash_password,
     verify_password,
 )
-from utils.db import get_db
-from utils.wallets import ensure_wallet, record_transaction
+from utils.db import get_client, get_db
+from utils.wallets import ensure_wallet
+from utils.credits import apply_credit_change, generate_referral_code, get_credit_settings
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -28,11 +34,50 @@ class RegisterInput(BaseModel):
     semester: int = 1
     location: str = ""
     skills: list[str] = []
+    referral_code: str = Field(default="", alias="referralCode")
 
 
 class LoginInput(BaseModel):
     email: str
     password: str
+
+
+class ForgotPasswordInput(BaseModel):
+    email: str
+
+
+class ResetPasswordInput(BaseModel):
+    email: str
+    otp: str
+    newPassword: str
+
+
+def _otp_digest(email: str, otp: str) -> str:
+    secret = os.getenv("JWT_SECRET", "notesphere-password-reset")
+    return hmac.new(secret.encode(), f"{email}:{otp}".encode(), hashlib.sha256).hexdigest()
+
+
+def _send_password_reset_email(email: str, otp: str) -> None:
+    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "465"))
+    username = os.getenv("SMTP_USER", os.getenv("EMAIL_USER", ""))
+    password = os.getenv("SMTP_PASSWORD", os.getenv("EMAIL_PASS", ""))
+    sender = os.getenv("SMTP_FROM", username)
+    if not username or not password or not sender:
+        raise RuntimeError("Email delivery is not configured. Set SMTP_USER and SMTP_PASSWORD in backend/.env")
+
+    message = EmailMessage()
+    message["Subject"] = "Notesphere password reset code"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(f"Your Notesphere password reset code is {otp}. It expires in 5 minutes.")
+    message.add_alternative(
+        f"<p>Your Notesphere password reset code is:</p><p style='font-size:28px;font-weight:bold;letter-spacing:6px'>{otp}</p><p>This code expires in 5 minutes. If you didn't request a reset, ignore this email.</p>",
+        subtype="html",
+    )
+    with smtplib.SMTP_SSL(host, port, timeout=15) as smtp:
+        smtp.login(username, password)
+        smtp.send_message(message)
 
 
 def serialize_user(user: dict, wallet: dict | None = None) -> dict:
@@ -49,10 +94,13 @@ def serialize_user(user: dict, wallet: dict | None = None) -> dict:
         "role": "admin" if is_admin else user.get("role", "user"),
         "is_admin": is_admin,
         "is_banned": bool(user.get("is_banned", False)),
-        "tokens": wallet_balance,
+        "last_login_at": user.get("last_login_at"),
+        "tokens": int(user.get("credits_balance", user.get("tokens", 0)) or 0),
         "wallet_balance": wallet_balance,
         "wallet_available": wallet_balance,
         "wallet_held": held_balance,
+        "credits_balance": int(user.get("credits_balance", 0) or 0),
+        "referral_code": user.get("referral_code", ""),
         "xp": user.get("xp", 0),
         "streak": user.get("streak", 0),
         "avatar": avatar_url,
@@ -108,6 +156,22 @@ async def register(data: RegisterInput):
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
 
+    referrer = None
+    referral_code = data.referral_code.strip().upper()
+    if referral_code:
+        referrer = await users.find_one({"referral_code": referral_code}, {"_id": 1, "email": 1})
+        if not referrer:
+            raise HTTPException(status_code=400, detail="Referral code is invalid")
+        if referrer.get("email", "").strip().lower() == email:
+            raise HTTPException(status_code=400, detail="You cannot refer your own account")
+
+    for _ in range(12):
+        user_referral_code = generate_referral_code()
+        if not await users.find_one({"referral_code": user_referral_code}, {"_id": 1}):
+            break
+    else:
+        raise HTTPException(status_code=500, detail="Unable to create a referral code")
+
     user_doc = {
         "uid": await generate_unique_uid(users),
         "name": data.name.strip(),
@@ -116,7 +180,9 @@ async def register(data: RegisterInput):
         "role": "user",
         "is_admin": False,
         "is_banned": False,
-        "tokens": 100,
+        "tokens": 0,
+        "credits_balance": 0,
+        "referral_code": user_referral_code,
         "xp": 0,
         "streak": 0,
         "avatar": "",
@@ -141,25 +207,101 @@ async def register(data: RegisterInput):
         "elite_seller_status": "none",
         "created_at": datetime.now(timezone.utc),
     }
-    result = await users.insert_one(user_doc)
-    user_doc["_id"] = result.inserted_id
+    settings = await get_credit_settings(db)
+    client = get_client()
+    try:
+        async with await client.start_session() as session:
+            async with session.start_transaction():
+                result = await users.insert_one(user_doc, session=session)
+                user_doc["_id"] = result.inserted_id
+                user_id = str(result.inserted_id)
+                if settings["signup_reward"]:
+                    await apply_credit_change(
+                        db,
+                        user_id=user_id,
+                        amount=settings["signup_reward"],
+                        transaction_type="SIGNUP_REWARD",
+                        description="Welcome to NotesSphere",
+                        idempotency_key=f"signup:{user_id}",
+                        reference_id=user_id,
+                        session=session,
+                    )
+                if referrer:
+                    await db.referrals.insert_one({
+                        "referrer_user_id": str(referrer["_id"]),
+                        "referred_user_id": user_id,
+                        "referral_code": referral_code,
+                        "status": "registered",
+                        "created_at": datetime.now(timezone.utc),
+                    }, session=session)
+    except DuplicateKeyError as exc:
+        raise HTTPException(status_code=409, detail="Account or referral code already exists. Please try again.") from exc
 
-    wallet = await ensure_wallet(db, str(result.inserted_id), seed_balance=100)
-    await record_transaction(
-        db,
-        user_id=str(result.inserted_id),
-        amount=100,
-        transaction_type="earn",
-        reason="Welcome wallet bonus",
-        source_type="auth",
-        source_id=str(result.inserted_id),
-    )
+    wallet = await ensure_wallet(db, str(result.inserted_id), seed_balance=0)
+    user_doc["credits_balance"] = settings["signup_reward"]
 
     return {
         "message": "User registered successfully",
         "access_token": create_access_token(str(result.inserted_id), email),
         "user": serialize_user(user_doc, wallet),
     }
+
+
+@router.post("/forgot-password")
+@router.post("/send-otp")
+async def send_password_reset_otp(data: ForgotPasswordInput):
+    email = data.email.strip().lower()
+    if "@" not in email or "." not in email.rsplit("@", 1)[-1]:
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+
+    db = get_db()
+    user = await db.users.find_one({"email": email}, {"_id": 1, "email": 1})
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found for this email")
+
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    expiry = datetime.now(timezone.utc).timestamp() + 300
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password_reset_otp_hash": _otp_digest(email, otp), "password_reset_otp_expiry": expiry}},
+    )
+    try:
+        import asyncio
+        await asyncio.get_running_loop().run_in_executor(None, _send_password_reset_email, email, otp)
+    except Exception as exc:
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$unset": {"password_reset_otp_hash": "", "password_reset_otp_expiry": ""}},
+        )
+        raise HTTPException(status_code=503, detail="Could not send OTP email. Check SMTP settings and try again.") from exc
+    return {"message": "OTP sent to your email. It expires in 5 minutes."}
+
+
+@router.post("/reset-password")
+async def reset_password(data: ResetPasswordInput):
+    email = data.email.strip().lower()
+    otp = data.otp.strip()
+    if "@" not in email or len(otp) != 6 or not otp.isdigit():
+        raise HTTPException(status_code=400, detail="Enter a valid email and 6-digit OTP")
+    if len(data.newPassword) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters")
+
+    db = get_db()
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(status_code=400, detail="OTP is invalid or expired. Request a new one.")
+    expiry = user.get("password_reset_otp_expiry", 0)
+    if isinstance(expiry, datetime):
+        expiry = expiry.timestamp()
+    expected = user.get("password_reset_otp_hash", "")
+    if not expected or float(expiry or 0) < datetime.now(timezone.utc).timestamp() or not hmac.compare_digest(expected, _otp_digest(email, otp)):
+        raise HTTPException(status_code=400, detail="OTP is invalid or expired. Request a new one.")
+
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password_hash": hash_password(data.newPassword)}, "$unset": {"password": "", "password_reset_otp_hash": "", "password_reset_otp_expiry": ""}},
+    )
+    return {"message": "Password reset successful. Sign in with your new password."}
 
 
 @router.post("/login")
@@ -181,6 +323,7 @@ async def login(data: LoginInput):
             "is_admin": True,
             "is_banned": False,
             "tokens": 0,
+            "credits_balance": 0,
             "xp": 0,
             "streak": 0,
             "avatar": "",

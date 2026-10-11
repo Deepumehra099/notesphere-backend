@@ -31,4 +31,17 @@ router.post("/:id/read", verifyToken, async (req, res) => {
   return res.json({ message: "Notification marked as read" });
 });
 
+router.delete("/:id", verifyToken, async (req, res) => {
+  const notification = await Notification.findOneAndDelete({
+    _id: req.params.id,
+    userId: req.user._id,
+  });
+
+  if (!notification) {
+    return res.status(404).json({ message: "Notification not found" });
+  }
+
+  return res.json({ message: "Notification deleted" });
+});
+
 module.exports = router;

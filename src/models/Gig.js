@@ -7,6 +7,8 @@ const gigSchema = new mongoose.Schema(
     category: { type: String, default: "General" },
     price: { type: Number, required: true },
     featured: { type: Boolean, default: false },
+    status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending", index: true },
+    rejectionReason: { type: String, default: "", trim: true },
     seller: {
       userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
       name: { type: String, required: true },

@@ -16,7 +16,7 @@ from pymongo import ReturnDocument
 
 from utils.auth_utils import get_current_user
 from utils.db import get_db
-from utils.wallets import debit_wallet, ensure_wallet, hold_wallet_funds, refund_held_funds, release_held_funds
+from utils.wallets import debit_wallet, ensure_wallet, get_platform_commission_percent, hold_wallet_funds, refund_held_funds, release_held_funds
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
@@ -43,6 +43,10 @@ class RateTaskInput(BaseModel):
 
 class ReportTaskInput(BaseModel):
     reason: str = Field(..., min_length=3, max_length=500)
+
+
+class DisputeTaskInput(BaseModel):
+    reason: str = Field(..., min_length=5, max_length=1000)
 
 
 def get_popularity_score(task: dict) -> int:
@@ -159,6 +163,8 @@ def serialize_task(task: dict) -> dict:
         "created_by": task.get("created_by", ""),
         "created_by_name": task.get("created_by_name", ""),
         "created_by_verified": bool(task.get("created_by_verified", False)),
+        "created_by_elite_buyer": bool(task.get("created_by_elite_buyer", False)),
+        "created_by_elite_seller": bool(task.get("created_by_elite_seller", False)),
         "created_by_rating": round(float(task.get("created_by_rating", 0) or 0), 1),
         "created_by_completed_tasks": int(task.get("created_by_completed_tasks", 0) or 0),
         "assigned_to": task.get("assigned_to"),
@@ -170,6 +176,8 @@ def serialize_task(task: dict) -> dict:
         "escrow_amount": task.get("escrow_amount", task.get("price", 0)),
         "commission_amount": task.get("commission_amount", 0),
         "seller_payout": task.get("seller_payout", 0),
+        "dispute_reason": task.get("dispute_reason", ""),
+        "dispute_opened_at": task.get("dispute_opened_at").isoformat() if isinstance(task.get("dispute_opened_at"), datetime) else task.get("dispute_opened_at"),
         "is_boosted": bool(task.get("is_boosted", False)),
         "boosted_at": task.get("boosted_at").isoformat() if isinstance(task.get("boosted_at"), datetime) else task.get("boosted_at"),
         "attachmentUrls": task.get("attachment_urls", []),
@@ -182,10 +190,14 @@ def serialize_task(task: dict) -> dict:
 def attach_creator_trust(task: dict, creator: dict | None) -> dict:
     if creator:
         task["created_by_verified"] = bool(creator.get("verified", False))
+        task["created_by_elite_buyer"] = bool(creator.get("elite_buyer_active", False))
+        task["created_by_elite_seller"] = bool(creator.get("elite_seller_active", False))
         task["created_by_rating"] = round(float(creator.get("task_rating", 0) or 0), 1)
         task["created_by_completed_tasks"] = int(creator.get("completed_tasks", 0) or 0)
     else:
         task["created_by_verified"] = bool(task.get("created_by_verified", False))
+        task["created_by_elite_buyer"] = bool(task.get("created_by_elite_buyer", False))
+        task["created_by_elite_seller"] = bool(task.get("created_by_elite_seller", False))
         task["created_by_rating"] = round(float(task.get("created_by_rating", 0) or 0), 1)
         task["created_by_completed_tasks"] = int(task.get("created_by_completed_tasks", 0) or 0)
     return task
@@ -222,7 +234,13 @@ async def hydrate_task_creators(db, tasks: list[dict]) -> list[dict]:
     if creator_ids:
         async for user in db.users.find(
             {"_id": {"$in": creator_ids}},
-            {"verified": 1, "task_rating": 1, "completed_tasks": 1},
+            {
+                "verified": 1,
+                "task_rating": 1,
+                "completed_tasks": 1,
+                "elite_buyer_active": 1,
+                "elite_seller_active": 1,
+            },
         ):
             creator_map[str(user["_id"])] = user
 
@@ -454,7 +472,6 @@ async def get_tasks(
     limit = max(1, min(limit, 10))
     query = {
         "status": "open",
-        "created_by": {"$ne": current_user["id"]},
         "$or": [{"assigned_to": None}, {"assigned_to": {"$exists": False}}],
     }
     projection = {
@@ -523,6 +540,11 @@ async def get_tasks(
     }
 
 
+@router.get("/commission")
+async def get_task_commission(_current_user=Depends(get_current_user)):
+    return {"commissionPercent": get_platform_commission_percent()}
+
+
 @router.get("/trending")
 async def get_trending_tasks(
     limit: int = 10,
@@ -532,7 +554,6 @@ async def get_trending_tasks(
     limit = max(1, min(limit, 20))
     query = {
         "status": "open",
-        "created_by": {"$ne": current_user["id"]},
         "$or": [{"assigned_to": None}, {"assigned_to": {"$exists": False}}],
     }
     cursor = db.tasks.find(query).sort(
@@ -781,6 +802,46 @@ async def complete_task(task_id: str, current_user=Depends(get_current_user)):
     }
 
 
+@router.post("/{task_id}/dispute")
+async def dispute_task(task_id: str, data: DisputeTaskInput, current_user=Depends(get_current_user)):
+    db = get_db()
+    object_id = parse_object_id(task_id)
+    task = await db.tasks.find_one({"_id": object_id})
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if current_user["id"] not in {task.get("created_by"), task.get("assigned_to")}:
+        raise HTTPException(status_code=403, detail="Only task participants can open a dispute")
+    if task.get("status") not in {"assigned", "submitted"} or task.get("escrow_status") != "held":
+        raise HTTPException(status_code=409, detail="This task is not eligible for an escrow dispute")
+    reason = data.reason.strip()
+
+    now = datetime.now(timezone.utc)
+    disputed = await db.tasks.find_one_and_update(
+        {"_id": object_id, "status": {"$in": ["assigned", "submitted"]}, "escrow_status": "held"},
+        {
+            "$set": {
+                "status": "disputed",
+                "escrow_status": "disputed",
+                "dispute_reason": reason,
+                "dispute_opened_by": current_user["id"],
+                "dispute_opened_at": now,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+    if not disputed:
+        raise HTTPException(status_code=409, detail="Task changed before dispute could be opened")
+    for participant_id in {task.get("created_by"), task.get("assigned_to")} - {None, ""}:
+        await db.notifications.insert_one({
+            "user_id": participant_id,
+            "title": "Task dispute opened",
+            "body": f"An escrow dispute was opened for {task.get('title', 'a task')}.",
+            "read": False,
+            "created_at": now,
+        })
+    return {"message": "Task dispute opened for admin review", "task": serialize_task(disputed)}
+
+
 @router.post("/{task_id}/rate")
 async def rate_task(task_id: str, data: RateTaskInput, current_user=Depends(get_current_user)):
     db = get_db()
@@ -931,7 +992,13 @@ async def get_task(task_id: str, current_user=Depends(get_current_user)):
         task["popularity_score"] = get_popularity_score(task)
 
     hydrated = await hydrate_task_creators(db, [task])
-    return {"task": serialize_task(hydrated[0])}
+    result = serialize_task(hydrated[0])
+    if (
+        not bool(current_user.get("is_admin") or current_user.get("role") == "admin")
+        and current_user["id"] not in {task.get("created_by"), task.get("assigned_to")}
+    ):
+        result["dispute_reason"] = ""
+    return {"task": result}
 
 
 @router.post("/{task_id}/report")

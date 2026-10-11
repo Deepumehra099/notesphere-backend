@@ -17,6 +17,8 @@ const noteSchema = new mongoose.Schema(
     description: { type: String, default: "", trim: true },
     tags: [{ type: String, trim: true }],
     price: { type: Number, default: 0 },
+    unlockCost: { type: Number, default: 0, min: 0 },
+    rewardIssuedAt: { type: Date, default: null },
     thumbnailUrl: { type: String, default: "" },
     pdfUrl: { type: String, default: "" },
     pdfPublicId: { type: String, default: "" },

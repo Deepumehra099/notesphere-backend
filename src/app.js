@@ -9,17 +9,26 @@ const homeRoutes = require("./routes/homeRoutes");
 const noteRoutes = require("./routes/noteRoutes");
 const taskRoutes = require("./routes/taskRoutes");
 const gigRoutes = require("./routes/gigRoutes");
+const marketplaceRoutes = require("./routes/marketplaceRoutes");
 const profileRoutes = require("./routes/profileRoutes");
 const walletRoutes = require("./routes/walletRoutes");
 const transactionRoutes = require("./routes/transactionRoutes");
 const paymentsRoutes = require("./routes/paymentsRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
+const depositRoutes = require("./routes/depositRoutes");
+const withdrawRoutes = require("./routes/withdrawRoutes");
+const chatRoutes = require("./routes/chatRoutes");
+const creditsRoutes = require("./routes/creditsRoutes");
 const { seedDatabase } = require("./seed");
 
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, _res, buffer) => {
+    if (req.originalUrl === "/api/payments/webhook") req.rawBody = Buffer.from(buffer);
+  },
+}));
 app.use(morgan("dev"));
 app.use("/uploads", express.static(path.resolve(__dirname, "../uploads")));
 
@@ -32,12 +41,21 @@ app.use("/api/admin", adminRoutes);
 app.use("/api/home", homeRoutes);
 app.use("/api/notes", noteRoutes);
 app.use("/api/tasks", taskRoutes);
+app.use("/api/task", taskRoutes);
 app.use("/api/gigs", gigRoutes);
+app.use("/api/marketplace", marketplaceRoutes);
 app.use("/api/profile", profileRoutes);
+app.use("/api/user", profileRoutes);
 app.use("/api/wallet", walletRoutes);
 app.use("/api/transactions", transactionRoutes);
+app.use("/api/transaction", transactionRoutes);
 app.use("/api/payments", paymentsRoutes);
+app.use("/api/deposit", depositRoutes);
+app.use("/api/withdraw", withdrawRoutes);
+app.use("/api/chat", chatRoutes);
+app.use("/api/credits", creditsRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/notification", notificationRoutes);
 
 app.use((err, _req, res, _next) => {
   console.error(err);

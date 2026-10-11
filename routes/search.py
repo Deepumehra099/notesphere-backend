@@ -37,6 +37,9 @@ async def search_notes(
         n["id"] = str(n.pop("_id"))
         n["unlocked_by"] = [str(uid) for uid in n.get("unlocked_by", [])]
         n["is_unlocked"] = current_user["id"] in n.get("unlocked_by", []) or n.get("uploaded_by") == current_user["id"]
+        if not n["is_unlocked"] and (n.get("unlock_cost", 0) or 0) > 0:
+            n["file_url"] = ""
+            n["pdf_url"] = ""
         notes.append(n)
 
     total = await db.notes.count_documents(query)

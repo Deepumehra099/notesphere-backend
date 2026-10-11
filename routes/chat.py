@@ -344,10 +344,18 @@ async def create_message(
     return msg_doc
 
 
-async def broadcast_presence(user_id: str, is_online: bool):
+async def broadcast_presence(user_id: str, is_online: bool, last_seen_at: datetime | None = None):
     recipients = [active_user_id for active_user_id in manager.active_user_ids() if active_user_id != user_id]
     if recipients:
-        await manager.send_to_many(recipients, {"type": "presence", "userId": user_id, "isOnline": is_online})
+        await manager.send_to_many(
+            recipients,
+            {
+                "type": "presence",
+                "userId": user_id,
+                "isOnline": is_online,
+                "lastSeenAt": last_seen_at.isoformat() if last_seen_at else None,
+            },
+        )
 
 
 async def handle_chat_socket(ws: WebSocket):
@@ -365,8 +373,34 @@ async def handle_chat_socket(ws: WebSocket):
         await ws.close(code=4401)
         return
 
+    db = get_db()
     became_online = await manager.connect(user_id, ws)
     if became_online:
+        # Reconnect delivers messages queued while this user was offline.
+        user_chats = db.chats.find({"participants": user_id}, {"_id": 1})
+        chat_ids = [str(chat["_id"]) async for chat in user_chats]
+        pending = db.messages.find(
+            {
+                "chat_id": {"$in": chat_ids},
+                "sender_id": {"$ne": user_id},
+                "status": "sent",
+                "hidden_for": {"$ne": user_id},
+            },
+            {"_id": 1, "chat_id": 1, "sender_id": 1},
+        )
+        deliveries: dict[tuple[str, str], list[str]] = {}
+        async for message in pending:
+            await db.messages.update_one(
+                {"_id": message["_id"], "status": "sent"},
+                {"$set": {"status": "delivered"}},
+            )
+            key = (str(message["chat_id"]), str(message["sender_id"]))
+            deliveries.setdefault(key, []).append(str(message["_id"]))
+        for (chat_id, sender_id), message_ids in deliveries.items():
+            await manager.send_to(
+                sender_id,
+                {"type": "messages_delivered", "chatId": chat_id, "messageIds": message_ids},
+            )
         await broadcast_presence(user_id, True)
     await manager.send_to(user_id, {"type": "presence_snapshot", "onlineUserIds": manager.active_user_ids()})
 
@@ -388,11 +422,15 @@ async def handle_chat_socket(ws: WebSocket):
     except WebSocketDisconnect:
         became_offline = manager.disconnect(user_id, ws)
         if became_offline:
-            await broadcast_presence(user_id, False)
+            last_seen_at = datetime.now(timezone.utc)
+            await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"last_seen_at": last_seen_at}})
+            await broadcast_presence(user_id, False, last_seen_at)
     except Exception:
         became_offline = manager.disconnect(user_id, ws)
         if became_offline:
-            await broadcast_presence(user_id, False)
+            last_seen_at = datetime.now(timezone.utc)
+            await db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"last_seen_at": last_seen_at}})
+            await broadcast_presence(user_id, False, last_seen_at)
         await ws.close(code=1011)
 
 
@@ -419,7 +457,9 @@ async def get_chat_rooms(current_user=Depends(get_current_user)):
         other_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task.get("created_by")
         if await is_blocked_between_users(db, current_user["id"], other_id):
             continue
-        other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"name": 1, "avatar_url": 1, "uid": 1})
+        other_user = await db.users.find_one(
+            {"_id": ObjectId(other_id)}, {"name": 1, "avatar_url": 1, "uid": 1, "last_seen_at": 1}
+        )
         c["task"] = {
             "id": str(task["_id"]),
             "title": task.get("title", "Task"),
@@ -427,6 +467,9 @@ async def get_chat_rooms(current_user=Depends(get_current_user)):
             "status": task.get("status", "assigned"),
             "price": task.get("price", 0),
         }
+        context = task.get("chat_context") or task.get("chatContext")
+        if isinstance(context, dict):
+            c["context"] = context
         if other_user:
             c["other_user"] = {
                 "id": other_id,
@@ -434,7 +477,20 @@ async def get_chat_rooms(current_user=Depends(get_current_user)):
                 "avatar_url": other_user.get("avatar_url", ""),
                 "uid": other_user.get("uid", ""),
                 "isOnline": manager.is_online(other_id),
+                "lastSeenAt": other_user.get("last_seen_at").isoformat()
+                if isinstance(other_user.get("last_seen_at"), datetime)
+                else other_user.get("last_seen_at"),
             }
+        c["message_count"] = await db.messages.count_documents(
+            {"chat_id": c["id"], "hidden_for": {"$ne": current_user["id"]}}
+        )
+        c["sent_message_count"] = await db.messages.count_documents(
+            {
+                "chat_id": c["id"],
+                "sender_id": current_user["id"],
+                "hidden_for": {"$ne": current_user["id"]},
+            }
+        )
         rooms.append(c)
     return {"rooms": rooms}
 
@@ -452,6 +508,32 @@ async def get_messages(chat_id: str, page: int = 1, limit: int = 50, current_use
         await enforce_not_blocked(db, current_user["id"], other_user_id)
 
     skip = (page - 1) * limit
+    newly_seen = []
+    async for message in db.messages.find(
+        {
+            "chat_id": chat_id,
+            "sender_id": {"$ne": current_user["id"]},
+            "status": {"$in": ["sent", "delivered"]},
+            "hidden_for": {"$ne": current_user["id"]},
+        }, {"_id": 1, "sender_id": 1}
+    ):
+        newly_seen.append(message)
+    if newly_seen:
+        await db.messages.update_many(
+            {"_id": {"$in": [message["_id"] for message in newly_seen]}},
+            {"$set": {"status": "seen"}},
+        )
+    if newly_seen:
+        await manager.send_to_many(
+            [str(participant) for participant in chat.get("participants", []) if str(participant) != current_user["id"]],
+            {
+                "type": "messages_seen",
+                "chatId": chat_id,
+                "seenBy": current_user["id"],
+                "messageIds": [str(message["_id"]) for message in newly_seen],
+            },
+        )
+    # Return updated statuses so the opened conversation shows read receipts immediately.
     cursor = (
         db.messages.find({"chat_id": chat_id, "hidden_for": {"$ne": current_user["id"]}})
         .sort("created_at", -1)
@@ -461,20 +543,6 @@ async def get_messages(chat_id: str, page: int = 1, limit: int = 50, current_use
     messages = []
     async for msg in cursor:
         messages.append(serialize_message(msg, current_user["id"]))
-
-    await db.messages.update_many(
-        {
-            "chat_id": chat_id,
-            "sender_id": {"$ne": current_user["id"]},
-            "status": {"$in": ["sent", "delivered"]},
-            "hidden_for": {"$ne": current_user["id"]},
-        },
-        {"$set": {"status": "seen"}},
-    )
-    await manager.send_to_many(
-        [str(participant) for participant in chat.get("participants", []) if str(participant) != current_user["id"]],
-        {"type": "messages_seen", "chatId": chat_id, "seenBy": current_user["id"]},
-    )
     return {"messages": list(reversed(messages))}
 
 

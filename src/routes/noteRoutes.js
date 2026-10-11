@@ -7,6 +7,7 @@ const { formatNote } = require("../utils/formatters");
 const { uploadAsset } = require("../services/storageService");
 const { notifyUser } = require("../services/notificationService");
 const { purchaseNote } = require("../services/walletService");
+const { changeTokens, getTokenSettings } = require("../services/tokenService");
 
 const router = express.Router();
 
@@ -74,10 +75,14 @@ router.post(
     { name: "pdf", maxCount: 1 },
   ]),
   async (req, res) => {
-    const { subject, topic, title, description, tags, price } = req.body;
+    const { subject, topic, title, description, tags, price, unlock_cost } = req.body;
 
     if (!subject || !topic || !title) {
       return res.status(400).json({ message: "Subject, topic, and title are required" });
+    }
+    const requestedTokenPrice = unlock_cost ?? price;
+    if (requestedTokenPrice !== undefined && requestedTokenPrice !== "" && (!Number.isSafeInteger(Number(requestedTokenPrice)) || Number(requestedTokenPrice) < 0)) {
+      return res.status(400).json({ message: "Premium note price must be a non-negative whole number of Tokens" });
     }
 
     const thumbnail = req.files?.thumbnail?.[0];
@@ -88,9 +93,11 @@ router.post(
     }
 
     const [thumbnailUpload, pdfUpload] = await Promise.all([
-      uploadAsset(thumbnail, "noteverse/notes/thumbnails", "image"),
-      uploadAsset(pdf, "noteverse/notes/pdfs", "raw"),
+      uploadAsset(thumbnail, "NoteSphere/notes/thumbnails", "image"),
+      uploadAsset(pdf, "NoteSphere/notes/pdfs", "raw"),
     ]);
+    const settings = await getTokenSettings();
+    const tokenPrice = Number(unlock_cost ?? price ?? settings.premiumNotePrice ?? 0);
 
     const note = await Note.create({
       title: String(title).trim(),
@@ -101,7 +108,8 @@ router.post(
         .split(",")
         .map((item) => item.trim())
         .filter(Boolean),
-      price: Number(price || 0),
+      price: tokenPrice,
+      unlockCost: tokenPrice,
       thumbnailUrl: thumbnailUpload.url,
       thumbnailPublicId: thumbnailUpload.publicId,
       pdfUrl: pdfUpload.url,

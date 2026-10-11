@@ -12,7 +12,8 @@ async function verifyToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, env.jwtSecret);
-    const user = await User.findById(decoded.userId);
+    const userId = decoded.id || decoded.userId;
+    const user = await User.findById(userId);
 
     if (!user) {
       return res.status(401).json({ message: "Unauthorized" });
@@ -23,6 +24,10 @@ async function verifyToken(req, res, next) {
     }
 
     req.user = user;
+    req.auth = {
+      id: user._id.toString(),
+      role: user.role,
+    };
     next();
   } catch (error) {
     return res.status(401).json({ message: "Unauthorized" });
@@ -37,4 +42,7 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-module.exports = { verifyToken, requireAdmin };
+const authMiddleware = verifyToken;
+const adminMiddleware = requireAdmin;
+
+module.exports = { verifyToken, requireAdmin, authMiddleware, adminMiddleware };

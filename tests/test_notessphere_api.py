@@ -69,7 +69,9 @@ class TestAuth:
         assert "access_token" in data
         assert "user" in data
         assert data["user"]["email"] == TEST_USER_EMAIL.lower()
-        assert data["user"]["tokens"] == 100  # Welcome bonus
+        assert data["user"]["tokens"] == 0  # Real-money wallet is not credited by signup
+        assert data["user"]["credits_balance"] >= 0
+        assert data["user"].get("referral_code")
         
         test_user_token = data["access_token"]
         test_user_id = data["user"]["id"]
@@ -202,9 +204,16 @@ class TestTokens:
         data = response.json()
         assert "transactions" in data
         assert "total" in data
-        assert len(data["transactions"]) > 0  # Should have welcome bonus
-        
-        # Verify transaction structure
+        # Signup rewards belong to the separate Credits ledger, never the INR wallet.
+        response = requests.get(f"{BASE_URL}/api/credits/history", headers=headers)
+        assert response.status_code == 200
+        credit_data = response.json()
+        assert "transactions" in credit_data
+        assert any(txn["type"] == "SIGNUP_REWARD" for txn in credit_data["transactions"])
+
+        # Verify real-money transaction structure when present.
+        if not data["transactions"]:
+            return
         txn = data["transactions"][0]
         assert "amount" in txn
         assert "type" in txn

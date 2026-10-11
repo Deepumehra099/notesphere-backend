@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
-from typing import Optional
+import re
+from typing import Literal, Optional
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -9,7 +10,7 @@ from pymongo import ReturnDocument
 
 from utils.auth_utils import get_current_user
 from utils.db import get_db
-from utils.wallets import debit_wallet, ensure_wallet
+from utils.wallets import commit_held_funds, debit_wallet, hold_wallet_funds, refund_held_funds
 
 router = APIRouter(prefix="/api/withdraw", tags=["withdrawals"])
 wallet_router = APIRouter(prefix="/api/wallet", tags=["withdrawals"])
@@ -18,8 +19,12 @@ MIN_WITHDRAW_AMOUNT = 100
 
 
 class WithdrawRequestInput(BaseModel):
-    amount: int = Field(..., ge=MIN_WITHDRAW_AMOUNT)
-    upi: str = Field(..., min_length=3, max_length=120)
+    amount: int = Field(..., ge=MIN_WITHDRAW_AMOUNT, le=50_000)
+    method: Literal["upi", "bank"] = "upi"
+    upi: str = Field(default="", max_length=120)
+    account_name: str = Field(default="", max_length=140)
+    account_number: str = Field(default="", max_length=40)
+    ifsc: str = Field(default="", max_length=20)
 
 
 def parse_object_id(value: str) -> ObjectId:
@@ -32,13 +37,21 @@ def parse_object_id(value: str) -> ObjectId:
 def serialize_request(item: dict) -> dict:
     created_at = item.get("created_at")
     updated_at = item.get("updated_at")
+    status = item.get("status", "pending")
+    status = "processing" if status in {"completing", "rejecting"} else status
     return {
         "id": str(item.get("_id")),
         "user_id": item.get("user_id", ""),
         "user_name": item.get("user_name", ""),
         "amount": int(item.get("amount", 0) or 0),
+        "method": item.get("method", "upi"),
         "upi": item.get("upi", ""),
-        "status": item.get("status", "pending"),
+        "account_name": item.get("account_name", ""),
+        "account_number": item.get("account_number", ""),
+        "ifsc": item.get("ifsc", ""),
+        "account_ref": item.get("account_number", "") if item.get("method") == "bank" else item.get("upi", ""),
+        "reference_id": str(item.get("_id", "")),
+        "status": status,
         "admin_note": item.get("admin_note", ""),
         "created_at": created_at.isoformat() if isinstance(created_at, datetime) else created_at,
         "updated_at": updated_at.isoformat() if isinstance(updated_at, datetime) else updated_at,
@@ -47,32 +60,77 @@ def serialize_request(item: dict) -> dict:
 
 async def create_withdrawal_request(data: WithdrawRequestInput, current_user=Depends(get_current_user)):
     db = get_db()
-    wallet = await ensure_wallet(db, current_user["id"])
-    available_balance = int(wallet.get("available_balance", 0) or 0)
-    if data.amount < MIN_WITHDRAW_AMOUNT:
-        raise HTTPException(status_code=400, detail=f"Minimum withdraw is ₹{MIN_WITHDRAW_AMOUNT}")
-    if available_balance < data.amount:
-        raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+    if data.amount > 50_000:
+        raise HTTPException(status_code=400, detail="Maximum withdrawal is ₹50,000 per request")
+
+    if data.method == "upi" and not re.fullmatch(r"[^\s@]+@[^\s@]+", data.upi.strip()):
+        raise HTTPException(status_code=400, detail="Enter a valid UPI ID")
+    if data.method == "bank":
+        if not data.account_name.strip() or not re.fullmatch(r"\d{6,20}", data.account_number.strip()):
+            raise HTTPException(status_code=400, detail="Enter a valid account name and account number")
+        if not re.fullmatch(r"[A-Za-z]{4}0[A-Za-z0-9]{6}", data.ifsc.strip()):
+            raise HTTPException(status_code=400, detail="Enter a valid IFSC code")
 
     pending_total = await db.withdraw_requests.count_documents(
-        {"user_id": current_user["id"], "status": "pending"}
+        {"user_id": current_user["id"], "status": {"$in": ["pending", "processing", "completing", "rejecting"]}}
     )
     if pending_total > 0:
         raise HTTPException(status_code=400, detail="You already have a pending withdrawal request")
 
     now = datetime.now(timezone.utc)
+    request_id = ObjectId()
     request_doc = {
+        "_id": request_id,
         "user_id": current_user["id"],
         "user_name": current_user.get("name", "User"),
         "amount": data.amount,
-        "upi": data.upi.strip(),
+        "method": data.method,
+        "upi": data.upi.strip() if data.method == "upi" else "",
+        "account_name": data.account_name.strip(),
+        "account_number": data.account_number.strip(),
+        "ifsc": data.ifsc.strip().upper(),
         "status": "pending",
+        "funds_reserved": True,
         "admin_note": "",
         "created_at": now,
         "updated_at": now,
     }
-    result = await db.withdraw_requests.insert_one(request_doc)
-    request_doc["_id"] = result.inserted_id
+    held_wallet = await hold_wallet_funds(
+        db,
+        user_id=current_user["id"],
+        amount=data.amount,
+        reason=f"Withdrawal requested via {data.method}",
+        source_type="withdrawal",
+        source_id=str(request_id),
+        metadata={"method": data.method},
+    )
+    if not held_wallet:
+        raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+
+    try:
+        await db.withdraw_requests.insert_one(request_doc)
+    except Exception:
+        refunded_wallet = await refund_held_funds(
+            db,
+            user_id=current_user["id"],
+            amount=data.amount,
+            reason="Withdrawal request could not be created",
+            source_type="withdrawal",
+            source_id=str(request_id),
+        )
+        if not refunded_wallet:
+            raise RuntimeError("Unable to refund wallet after withdrawal request creation failed")
+        await db.transactions.update_one(
+            {
+                "user_id": current_user["id"],
+                "source_type": "withdrawal",
+                "source_id": str(request_id),
+                "status": "pending",
+            },
+            {"$set": {"status": "failed", "reason": "Withdrawal request could not be created"}},
+        )
+        raise
+
     return {"message": "Withdrawal request created", "request": serialize_request(request_doc)}
 
 
@@ -150,38 +208,73 @@ async def get_withdrawals_plural(admin=Depends(require_admin)):
 async def approve_withdrawal_impl(request_id: str, admin=Depends(require_admin)):
     db = get_db()
     object_id = parse_object_id(request_id)
-    request_doc = await db.withdraw_requests.find_one({"_id": object_id})
-    if not request_doc:
-        raise HTTPException(status_code=404, detail="Withdrawal request not found")
-    if request_doc.get("status") != "pending":
-        raise HTTPException(status_code=400, detail="Withdrawal request already processed")
-
-    debited_wallet = await debit_wallet(
-        db,
-        user_id=request_doc["user_id"],
-        amount=int(request_doc["amount"] or 0),
-        reason=f"Withdrawal approved to {request_doc['upi']}",
-        transaction_type="withdraw",
-        source_type="withdrawal",
-        source_id=request_id,
-        metadata={"upi": request_doc["upi"], "approved_by": admin["id"]},
+    updated = await db.withdraw_requests.find_one_and_update(
+        {"_id": object_id, "status": "pending"},
+        {"$set": {"status": "processing", "updated_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.AFTER,
     )
-    if not debited_wallet:
+    if not updated:
+        exists = await db.withdraw_requests.find_one({"_id": object_id}, {"_id": 1})
+        if not exists:
+            raise HTTPException(status_code=404, detail="Withdrawal request not found")
+        raise HTTPException(status_code=400, detail="Withdrawal request already processed")
+    return {"message": "Withdrawal is processing", "request": serialize_request(updated)}
+
+
+async def complete_withdrawal_impl(request_id: str, admin=Depends(require_admin)):
+    db = get_db()
+    object_id = parse_object_id(request_id)
+    request_doc = await db.withdraw_requests.find_one_and_update(
+        {"_id": object_id, "status": "processing"},
+        {"$set": {"status": "completing", "updated_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.BEFORE,
+    )
+    if not request_doc:
+        exists = await db.withdraw_requests.find_one({"_id": object_id}, {"_id": 1})
+        if not exists:
+            raise HTTPException(status_code=404, detail="Withdrawal request not found")
+        raise HTTPException(status_code=400, detail="Withdrawal is not processing")
+
+    if request_doc.get("funds_reserved"):
+        settled_wallet = await commit_held_funds(
+            db,
+            user_id=request_doc["user_id"],
+            amount=int(request_doc["amount"] or 0),
+            source_type="withdrawal",
+            source_id=request_id,
+        )
+    else:
+        settled_wallet = await debit_wallet(
+            db,
+            user_id=request_doc["user_id"],
+            amount=int(request_doc["amount"] or 0),
+            reason=f"Withdrawal approved via {request_doc.get('method', 'upi')}",
+            transaction_type="withdraw",
+            source_type="withdrawal",
+            source_id=request_id,
+            metadata={"approved_by": admin["id"]},
+        )
+    if not settled_wallet:
+        await db.withdraw_requests.update_one(
+            {"_id": object_id, "status": "completing"},
+            {"$set": {"status": "processing", "updated_at": datetime.now(timezone.utc)}},
+        )
         raise HTTPException(status_code=400, detail="User no longer has sufficient wallet balance")
 
     updated = await db.withdraw_requests.find_one_and_update(
-        {"_id": object_id, "status": "pending"},
+        {"_id": object_id, "status": "completing"},
         {
             "$set": {
-                "status": "approved",
-                "admin_note": "Approved",
-                "approved_by": admin["id"],
+                "status": "completed",
+                "admin_note": "Withdrawal completed",
+                "completed_by": admin["id"],
+                "completed_at": datetime.now(timezone.utc),
                 "updated_at": datetime.now(timezone.utc),
             }
         },
         return_document=ReturnDocument.AFTER,
     )
-    return {"message": "Withdrawal approved", "request": serialize_request(updated)}
+    return {"message": "Withdrawal completed", "request": serialize_request(updated)}
 
 
 @admin_router.put("/{request_id}/approve")
@@ -194,11 +287,55 @@ async def approve_withdrawal_plural(request_id: str, admin=Depends(require_admin
     return await approve_withdrawal_impl(request_id, admin)
 
 
+@admin_router.put("/{request_id}/complete")
+async def complete_withdrawal(request_id: str, admin=Depends(require_admin)):
+    return await complete_withdrawal_impl(request_id, admin)
+
+
+@admin_plural_router.post("/{request_id}/complete")
+async def complete_withdrawal_plural(request_id: str, admin=Depends(require_admin)):
+    return await complete_withdrawal_impl(request_id, admin)
+
+
 async def reject_withdrawal_impl(request_id: str, admin=Depends(require_admin)):
     db = get_db()
     object_id = parse_object_id(request_id)
-    updated = await db.withdraw_requests.find_one_and_update(
+    request_doc = await db.withdraw_requests.find_one_and_update(
         {"_id": object_id, "status": "pending"},
+        {"$set": {"status": "rejecting", "updated_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.BEFORE,
+    )
+    if not request_doc:
+        raise HTTPException(status_code=404, detail="Pending withdrawal request not found")
+
+    if request_doc.get("funds_reserved"):
+        refunded_wallet = await refund_held_funds(
+            db,
+            user_id=request_doc["user_id"],
+            amount=int(request_doc["amount"] or 0),
+            reason="Withdrawal rejected",
+            source_type="withdrawal",
+            source_id=request_id,
+            metadata={"rejected_by": admin["id"]},
+        )
+        if not refunded_wallet:
+            await db.withdraw_requests.update_one(
+                {"_id": object_id, "status": "rejecting"},
+                {"$set": {"status": "pending", "updated_at": datetime.now(timezone.utc)}},
+            )
+            raise HTTPException(status_code=400, detail="Unable to refund held withdrawal amount")
+
+        await db.transactions.update_one(
+            {
+                "user_id": request_doc["user_id"],
+                "source_type": "withdrawal",
+                "source_id": request_id,
+                "status": "pending",
+            },
+            {"$set": {"status": "failed", "reason": "Withdrawal rejected"}},
+        )
+    updated = await db.withdraw_requests.find_one_and_update(
+        {"_id": object_id, "status": "rejecting"},
         {
             "$set": {
                 "status": "rejected",
@@ -209,8 +346,6 @@ async def reject_withdrawal_impl(request_id: str, admin=Depends(require_admin)):
         },
         return_document=ReturnDocument.AFTER,
     )
-    if not updated:
-        raise HTTPException(status_code=404, detail="Pending withdrawal request not found")
     return {"message": "Withdrawal rejected", "request": serialize_request(updated)}
 
 

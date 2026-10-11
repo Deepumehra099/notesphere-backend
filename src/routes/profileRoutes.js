@@ -12,28 +12,27 @@ const { formatUser } = require("../utils/formatters");
 
 const router = express.Router();
 
-router.get("/", verifyToken, async (req, res) => {
-  const wallet = await ensureWallet(req.user._id);
-  const [myNotes, myTasks, inboxCount] = await Promise.all([
-    Note.countDocuments({ "seller.userId": req.user._id }),
+async function buildProfilePayload(userId) {
+  const wallet = await ensureWallet(userId);
+  const [user, myNotes, myTasks, inboxCount] = await Promise.all([
+    User.findById(userId),
+    Note.countDocuments({ "seller.userId": userId }),
     Task.countDocuments({
-      $or: [{ "createdBy.userId": req.user._id }, { "acceptedBy.userId": req.user._id }],
+      $or: [{ "createdBy.userId": userId }, { "acceptedBy.userId": userId }],
     }),
-    Notification.countDocuments({ userId: req.user._id, read: false }),
+    Notification.countDocuments({ userId, read: false }),
   ]);
 
-  return res.json({
-    profile: {
-      ...formatUser(req.user),
-      walletSummary: buildWalletResponse(wallet),
-      notes: myNotes,
-      tasks: myTasks,
-      inboxCount,
-    },
-  });
-});
+  return {
+    ...formatUser(user),
+    walletSummary: buildWalletResponse(wallet),
+    notes: myNotes,
+    tasks: myTasks,
+    inboxCount,
+  };
+}
 
-router.put("/", verifyToken, upload.single("avatar"), async (req, res) => {
+async function updateProfile(req, res) {
   const updates = {
     name: String(req.body.name || req.user.name).trim(),
     email: String(req.body.email || req.user.email).trim().toLowerCase(),
@@ -66,7 +65,7 @@ router.put("/", verifyToken, upload.single("avatar"), async (req, res) => {
   }
 
   if (req.file) {
-    const avatar = await uploadAsset(req.file, "noteverse/avatars", "image");
+    const avatar = await uploadAsset(req.file, "NoteSphere/avatars", "image");
     updates.avatarUrl = avatar.url;
   }
 
@@ -75,6 +74,47 @@ router.put("/", verifyToken, upload.single("avatar"), async (req, res) => {
     message: "Profile updated",
     user: formatUser(user),
   });
+}
+
+router.get("/", verifyToken, async (req, res) => {
+  return res.json({
+    profile: await buildProfilePayload(req.user._id),
+  });
+});
+
+router.get("/profile", verifyToken, async (req, res) => {
+  return res.json({
+    user: await buildProfilePayload(req.user._id),
+  });
+});
+
+router.put("/", verifyToken, upload.single("avatar"), updateProfile);
+
+router.post("/upload-avatar", verifyToken, upload.single("avatar"), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ message: "Avatar file is required" });
+  }
+
+  const avatar = await uploadAsset(req.file, "NoteSphere/avatars", "image");
+  const user = await User.findByIdAndUpdate(
+    req.user._id,
+    { $set: { avatarUrl: avatar.url } },
+    { new: true }
+  );
+
+  return res.json({ message: "Avatar updated", user: formatUser(user) });
+});
+
+router.post("/update-profile", verifyToken, upload.single("avatar"), updateProfile);
+
+router.put("/language", verifyToken, async (req, res) => {
+  const language = String(req.body.language || "").trim().toLowerCase();
+  if (!["en", "hi"].includes(language)) {
+    return res.status(400).json({ message: "Unsupported language" });
+  }
+
+  const user = await User.findByIdAndUpdate(req.user._id, { $set: { language } }, { new: true });
+  return res.json({ message: "Language updated", user: formatUser(user) });
 });
 
 module.exports = router;

@@ -15,8 +15,13 @@ from routes.account import orders_router, support_router, wishlist_router
 from routes.admin import router as admin_router
 from routes.auth import router as auth_router
 from routes.chat import router as chat_router, ws_router as chat_ws_router
+from routes.deposits import admin_router as deposits_admin_router, router as deposits_router
+from routes.credits import admin_router as credits_admin_router, router as credits_router
 from routes.gigs import router as gigs_router
+from routes.marketplace import router as marketplace_router
+from routes.marketplace_listings import admin_router as marketplace_admin_router, router as marketplace_listings_router
 from routes.notes import router as notes_router, upload_note as upload_note_handler
+from routes.notifications import router as notifications_router
 from routes.payments import payment_router, router as payments_router
 from routes.search import router as search_router
 from routes.tasks import router as tasks_router
@@ -105,9 +110,16 @@ app.include_router(notes_router)
 app.include_router(ai_router)
 app.include_router(chat_router)
 app.include_router(chat_ws_router)
+app.include_router(deposits_router)
+app.include_router(deposits_admin_router)
 app.include_router(gigs_router)
+app.include_router(marketplace_router)
+app.include_router(marketplace_listings_router)
+app.include_router(marketplace_admin_router)
 app.include_router(wallet_router)
 app.include_router(legacy_tokens_router)
+app.include_router(credits_router)
+app.include_router(credits_admin_router)
 app.include_router(payments_router)
 app.include_router(payment_router)
 app.include_router(search_router)
@@ -117,6 +129,7 @@ app.include_router(user_search_router)
 app.include_router(orders_router)
 app.include_router(wishlist_router)
 app.include_router(support_router)
+app.include_router(notifications_router)
 app.include_router(withdraw_router)
 app.include_router(withdraw_wallet_router)
 app.include_router(withdraw_admin_router)
@@ -126,6 +139,11 @@ app.include_router(withdraw_admin_plural_router)
 @app.on_event("startup")
 async def ensure_indexes():
     db = get_db()
+    await db.transactions.create_index(
+        "idempotency_key",
+        unique=True,
+        partialFilterExpression={"idempotency_key": {"$type": "string"}},
+    )
     await db.tasks.create_index(
         [
             ("status", ASCENDING),
@@ -149,9 +167,22 @@ async def ensure_indexes():
     await db.reports.create_index([("reported_by", ASCENDING), ("created_at", DESCENDING)])
     await db.users.create_index([("email", ASCENDING)], unique=True)
     await db.users.create_index([("uid", ASCENDING)], unique=True)
+    await db.users.update_many(
+        {"$or": [{"credits_balance": {"$exists": False}}, {"credits_balance": None}]},
+        {"$set": {"credits_balance": 0}},
+    )
+    # Keep this index definition compatible with existing databases where the
+    # original unique string-only referral_code index is already present.
+    await db.users.create_index("referral_code", unique=True, partialFilterExpression={"referral_code": {"$type": "string"}})
+    await db.credit_transactions.create_index("idempotency_key", unique=True)
+    await db.credit_transactions.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.credit_transactions.create_index([("type", ASCENDING), ("created_at", DESCENDING)])
+    await db.referrals.create_index("referred_user_id", unique=True)
+    await db.referrals.create_index([("referrer_user_id", ASCENDING), ("created_at", DESCENDING)])
     await db.users.create_index([("is_admin", ASCENDING), ("is_banned", ASCENDING), ("created_at", DESCENDING)])
     await db.gigs.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
     await db.gigs.create_index([("is_featured", DESCENDING), ("created_at", DESCENDING)])
+    await db.gigs.create_index([("approval_status", ASCENDING), ("is_featured", DESCENDING), ("created_at", DESCENDING)])
     await db.notes.create_index([("status", ASCENDING), ("created_at", DESCENDING)])
     await db.notes.create_index([("status", ASCENDING), ("unlock_cost", ASCENDING), ("created_at", DESCENDING)])
     await db.chats.create_index([("task_id", ASCENDING)], unique=True)
@@ -162,6 +193,14 @@ async def ensure_indexes():
     await db.subscription_orders.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
     await db.support_tickets.create_index([("user_id", ASCENDING), ("updated_at", DESCENDING)])
     await db.withdraw_requests.create_index([("user_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)])
+    await db.deposit_requests.create_index([("user_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)])
+    await db.notifications.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.marketplace_listings.create_index([("kind", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)])
+    await db.marketplace_listings.create_index([("seller_id", ASCENDING), ("kind", ASCENDING), ("created_at", DESCENDING)])
+    await db.marketplace_purchases.create_index([("listing_id", ASCENDING), ("buyer_id", ASCENDING)], unique=True)
+    await db.marketplace_purchases.create_index([("buyer_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.marketplace_purchases.create_index([("seller_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.marketplace_chat_threads.create_index([("listing_id", ASCENDING), ("buyer_id", ASCENDING)], unique=True)
 
 
 # =========================

@@ -15,11 +15,11 @@ payment_router = APIRouter(prefix="/api/payment", tags=["payments"])
 db = get_db()
 logger = logging.getLogger(__name__)
 
-TOKEN_PACKAGES = [
-    {"id": "pack_50", "tokens": 50, "price": 49, "label": "50 Wallet Credits", "popular": False},
-    {"id": "pack_100", "tokens": 100, "price": 89, "label": "100 Wallet Credits", "popular": True},
-    {"id": "pack_250", "tokens": 250, "price": 199, "label": "250 Wallet Credits", "popular": False},
-    {"id": "pack_500", "tokens": 500, "price": 349, "label": "500 Wallet Credits", "popular": False},
+WALLET_PACKAGES = [
+    {"id": "pack_50", "wallet_amount": 50, "price": 49, "label": "₹50 INR", "popular": False},
+    {"id": "pack_100", "wallet_amount": 100, "price": 89, "label": "₹100 INR", "popular": True},
+    {"id": "pack_250", "wallet_amount": 250, "price": 199, "label": "₹250 INR", "popular": False},
+    {"id": "pack_500", "wallet_amount": 500, "price": 349, "label": "₹500 INR", "popular": False},
 ]
 
 SUBSCRIPTION_PLANS = [
@@ -59,8 +59,7 @@ class SubscriptionInput(BaseModel):
 @router.get("/packages")
 async def get_packages(current_user=Depends(get_current_user)):
     packages = []
-    for package in TOKEN_PACKAGES:
-        packages.append({**package, "credits": package["tokens"]})
+    packages = [dict(package) for package in WALLET_PACKAGES]
     return {"packages": packages}
 
 
@@ -71,7 +70,7 @@ async def get_subscription_plans(current_user=Depends(get_current_user)):
 
 @router.post("/create-order")
 async def create_order(data: CreateOrderInput, current_user=Depends(get_current_user)):
-    package = next((p for p in TOKEN_PACKAGES if p["id"] == data.package_id), None)
+    package = next((p for p in WALLET_PACKAGES if p["id"] == data.package_id), None)
     if not package:
         raise HTTPException(status_code=400, detail="Invalid package")
 
@@ -101,7 +100,7 @@ async def create_order(data: CreateOrderInput, current_user=Depends(get_current_
                 "order_id": razor_order["id"],
                 "user_id": current_user["id"],
                 "package_id": package["id"],
-                "tokens": package["tokens"],
+                "wallet_amount": package["wallet_amount"],
                 "amount": package["price"] * 100,
                 "currency": "INR",
                 "status": "created",
@@ -132,7 +131,7 @@ async def verify_payment(data: VerifyPaymentInput, current_user=Depends(get_curr
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
     if order.get("status") == "paid":
-        return {"message": "Already processed", "tokens_added": order["tokens"]}
+        return {"message": "Already processed", "wallet_amount_added": order.get("wallet_amount", order.get("tokens", 0))}
 
     if not data.payment_id or not data.signature:
         raise HTTPException(status_code=400, detail="Payment details are required before wallet credits can be added")
@@ -153,25 +152,51 @@ async def verify_payment(data: VerifyPaymentInput, current_user=Depends(get_curr
                 "razorpay_signature": data.signature,
             }
         )
+        payment = client.payment.fetch(data.payment_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Payment verification failed")
+    if (
+        payment.get("order_id") != data.order_id
+        or int(payment.get("amount", 0) or 0) != int(order.get("amount", 0) or 0)
+        or payment.get("currency") != order.get("currency", "INR")
+        or payment.get("status") != "captured"
+    ):
+        raise HTTPException(status_code=400, detail="Razorpay payment is not captured for this order")
 
-    tokens = order["tokens"]
+    if order.get("status") == "created":
+        claim = await db.payment_orders.update_one(
+            {"order_id": data.order_id, "user_id": current_user["id"], "status": "created"},
+            {"$set": {"status": "processing", "payment_id": data.payment_id}},
+        )
+        if claim.modified_count == 1:
+            order["status"] = "processing"
+            order["payment_id"] = data.payment_id
+        else:
+            order = await db.payment_orders.find_one({"order_id": data.order_id, "user_id": current_user["id"]})
+    if not order or order.get("status") != "processing" or order.get("payment_id") != data.payment_id:
+        raise HTTPException(status_code=409, detail="Payment order is already being processed or is not payable")
+
+    wallet_amount = int(order.get("wallet_amount", order.get("tokens", 0)) or 0)
     await credit_wallet(
         db,
         user_id=current_user["id"],
-        amount=tokens,
-        reason=f"Wallet top-up: {tokens} credits",
+        amount=wallet_amount,
+        reason=f"INR wallet deposit: ₹{wallet_amount}",
         transaction_type="top_up",
         source_type="payment_order",
         source_id=data.order_id,
         metadata={"payment_id": data.payment_id, "package_id": order.get("package_id", "")},
+        idempotency_key=f"razorpay:{data.order_id}",
     )
-    await db.payment_orders.update_one(
-        {"order_id": data.order_id},
+    result = await db.payment_orders.update_one(
+        {"order_id": data.order_id, "user_id": current_user["id"], "status": "processing", "payment_id": data.payment_id},
         {"$set": {"status": "paid", "payment_id": data.payment_id, "paid_at": datetime.now(timezone.utc)}},
     )
-    return {"message": "Payment verified", "tokens_added": tokens, "credits_added": tokens}
+    if result.modified_count != 1:
+        current_order = await db.payment_orders.find_one({"order_id": data.order_id})
+        if not current_order or current_order.get("status") != "paid":
+            raise HTTPException(status_code=500, detail="Wallet credited but payment finalization needs reconciliation")
+    return {"message": "Payment verified", "wallet_amount_added": wallet_amount}
 
 
 async def create_subscription_order(data: SubscriptionInput, current_user):
