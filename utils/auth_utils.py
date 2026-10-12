@@ -11,9 +11,10 @@ MIN_JWT_SECRET_LENGTH = 32
 def get_jwt_secret():
     secret = os.environ.get("JWT_SECRET", "")
     if not secret:
-        raise RuntimeError("JWT_SECRET is not configured")
+        raise RuntimeError("JWT_SECRET is not configured; set it in the backend environment")
     if len(secret.encode("utf-8")) < MIN_JWT_SECRET_LENGTH:
-        # Pad short local secrets to avoid weak-key warnings while keeping a stable signing key.
+        # Preserve tokens issued by earlier versions; rotate to a random 32+ byte
+        # Render secret before the next production release for better entropy.
         secret = secret.ljust(MIN_JWT_SECRET_LENGTH, "_")
     return secret
 

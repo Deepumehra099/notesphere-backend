@@ -63,15 +63,23 @@ app = FastAPI()
 uploads_dir = Path(__file__).resolve().parent / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
+class ProtectedUploadsStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        if path.replace("\\", "/").startswith("notes/"):
+            from starlette.responses import JSONResponse
+            return JSONResponse({"detail": "Not found"}, status_code=404)
+        return await super().get_response(path, scope)
+
 # ✅ CORS
+allowed_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",") if origin.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=allowed_origins or ["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/uploads", StaticFiles(directory=str(uploads_dir)), name="uploads")
+app.mount("/uploads", ProtectedUploadsStaticFiles(directory=str(uploads_dir)), name="uploads")
 
 # =========================
 # 🔐 ADMIN LOGIN MODEL
@@ -138,7 +146,11 @@ app.include_router(withdraw_admin_plural_router)
 
 @app.on_event("startup")
 async def ensure_indexes():
+    required = [name for name in ("MONGO_URL", "DB_NAME", "JWT_SECRET") if not os.getenv(name, "").strip()]
+    if required:
+        raise RuntimeError("Required production environment variables are missing: " + ", ".join(required))
     db = get_db()
+    await get_db().command("ping")
     await db.transactions.create_index(
         "idempotency_key",
         unique=True,
@@ -185,6 +197,8 @@ async def ensure_indexes():
     await db.gigs.create_index([("approval_status", ASCENDING), ("is_featured", DESCENDING), ("created_at", DESCENDING)])
     await db.notes.create_index([("status", ASCENDING), ("created_at", DESCENDING)])
     await db.notes.create_index([("status", ASCENDING), ("unlock_cost", ASCENDING), ("created_at", DESCENDING)])
+    await db.note_views.create_index([("note_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    await db.note_downloads.create_index([("note_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
     await db.chats.create_index([("task_id", ASCENDING)], unique=True)
     await db.messages.create_index([("chat_id", ASCENDING), ("created_at", DESCENDING)])
     await db.transactions.create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
@@ -217,8 +231,12 @@ def api():
 
 
 @app.get("/api/health")
-def health():
-    return {"status": "healthy"}
+async def health():
+    try:
+        await get_db().command("ping")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return {"status": "healthy", "database": "connected"}
 
 
 @app.get("/api/home")

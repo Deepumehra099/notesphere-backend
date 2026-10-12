@@ -1,5 +1,6 @@
 import logging
 import os
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -10,6 +11,7 @@ import cloudinary.uploader
 from bson import ObjectId
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from pymongo import ReturnDocument
 
 from utils.auth_utils import get_current_user
@@ -73,9 +75,10 @@ def serialize_note(note, viewer_id: str | None = None):
         or str(n.get("uploaded_by", "")) == str(viewer_id or "")
         or str(viewer_id or "") in unlocked_by
     )
-    if not has_access:
-        n["file_url"] = ""
-        n["pdf_url"] = ""
+    # Content is always delivered through the authenticated /content route.
+    # Never serialize a storage URL (including after a premium unlock).
+    n["file_url"] = ""
+    n["pdf_url"] = ""
     if "unlocked_by" in n:
         n["unlocked_by"] = [str(uid) for uid in n.get("unlocked_by", [])]
     return n
@@ -171,10 +174,23 @@ async def get_purchased_notes(current_user=Depends(get_current_user)):
 @router.get("/{note_id}")
 async def get_note(note_id: str, current_user=Depends(get_current_user)):
     db = get_db()
-    note = await db.notes.find_one({"_id": ObjectId(note_id)})
+    try:
+        note_object_id = ObjectId(note_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Note not found") from exc
+    note = await db.notes.find_one({"_id": note_object_id})
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
-    await db.notes.update_one({"_id": ObjectId(note_id)}, {"$inc": {"views": 1}})
+    if note.get("status") != "approved" and note.get("uploaded_by") != current_user["id"] and current_user.get("role") != "admin":
+        raise HTTPException(status_code=404, detail="Note not found")
+    try:
+        await db.note_views.insert_one({"note_id": note_id, "user_id": current_user["id"], "first_viewed_at": datetime.now(timezone.utc)})
+        await db.notes.update_one({"_id": note_object_id}, {"$inc": {"views": 1}})
+        note["views"] = int(note.get("views", 0) or 0) + 1
+    except Exception as exc:
+        from pymongo.errors import DuplicateKeyError
+        if not isinstance(exc, DuplicateKeyError):
+            raise
     n = serialize_note(note, current_user["id"])
     n["is_unlocked"] = (
         n.get("price", 0) <= 0
@@ -182,6 +198,53 @@ async def get_note(note_id: str, current_user=Depends(get_current_user)):
         or n.get("uploaded_by") == current_user["id"]
     )
     return {"note": n}
+
+
+def _stream_remote_file(url: str):
+    from urllib.request import Request, urlopen
+    request = Request(url, headers={"User-Agent": "NotesSphere/1.0"})
+    with urlopen(request, timeout=30) as response:
+        while True:
+            chunk = response.read(64 * 1024)
+            if not chunk:
+                break
+            yield chunk
+
+
+@router.get("/{note_id}/content")
+async def get_note_content(note_id: str, current_user=Depends(get_current_user)):
+    try:
+        note_object_id = ObjectId(note_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Note not found") from exc
+    note = await get_db().notes.find_one({"_id": note_object_id})
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    user_id = current_user["id"]
+    if note.get("status") != "approved" and note.get("uploaded_by") != user_id and current_user.get("role") != "admin":
+        raise HTTPException(status_code=404, detail="Note not found")
+    allowed = (int(note.get("unlock_cost", 0) or 0) <= 0 or note.get("uploaded_by") == user_id or user_id in [str(value) for value in note.get("unlocked_by", [])] or current_user.get("role") == "admin")
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Unlock this note before reading it")
+    file_url = str(note.get("file_url") or note.get("pdf_url") or "")
+    if note.get("cloudinary_public_id"):
+        from cloudinary.utils import private_download_url
+        file_url = private_download_url(
+            note["cloudinary_public_id"], note.get("cloudinary_format") or "pdf",
+            resource_type=note.get("cloudinary_resource_type") or "raw",
+            type="authenticated", expires_at=int(datetime.now(timezone.utc).timestamp()) + 60,
+        )
+    filename = Path(str(note.get("file_name") or "note.pdf")).name.replace('"', "")
+    headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Content-Disposition": f'inline; filename="{filename}"'}
+    if file_url.startswith("/uploads/notes/"):
+        target = (UPLOADS_ROOT / file_url.removeprefix("/uploads/")).resolve()
+        if not target.is_relative_to(NOTES_UPLOADS_DIR.resolve()) or not target.is_file():
+            raise HTTPException(status_code=404, detail="PDF is unavailable")
+        return FileResponse(target, media_type="application/pdf", headers=headers, filename=None)
+    parsed = urlparse(file_url)
+    if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".cloudinary.com"):
+        raise HTTPException(status_code=404, detail="PDF is unavailable")
+    return StreamingResponse(_stream_remote_file(file_url), media_type="application/pdf", headers=headers)
 
 @router.post("/upload")
 async def upload_note(
@@ -222,6 +285,7 @@ async def upload_note(
     except (TypeError, ValueError):
         final_price = 0
     thumbnail_url = ""
+    result = {}
 
     public_id = f"notesphere/notes/{current_user['id']}_{int(datetime.now().timestamp())}"
 
@@ -232,18 +296,14 @@ async def upload_note(
             result = cloudinary.uploader.upload(
                 actual_file.file,
                 resource_type="auto",
+                type="authenticated",
                 public_id=public_id,
                 overwrite=True,
             )
             secure_url = result.get("secure_url")
             if not secure_url:
                 raise RuntimeError("Cloudinary did not return secure_url")
-            logger.info(
-                "Cloudinary upload success. user_id=%s filename=%s file_url=%s",
-                current_user["id"],
-                actual_file.filename,
-                secure_url,
-            )
+            logger.info("Cloudinary upload success. user_id=%s filename=%s", current_user["id"], actual_file.filename)
 
             if thumbnail is not None and thumbnail.filename:
                 thumbnail.file.seek(0)
@@ -258,13 +318,13 @@ async def upload_note(
             if thumbnail is not None and thumbnail.filename:
                 thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
     except Exception as e:
-        logger.exception("Primary upload failed for filename=%s: %s. Falling back to local storage.", actual_file.filename, e)
+        logger.warning("Primary note upload failed; using local storage fallback. error_type=%s", type(e).__name__)
         try:
             secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
             if thumbnail is not None and thumbnail.filename and not thumbnail_url:
                 thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
-        except Exception:
-            logger.exception("Local upload fallback also failed for filename=%s", actual_file.filename)
+        except Exception as local_error:
+            logger.error("Local note upload fallback failed. error_type=%s", type(local_error).__name__)
             raise HTTPException(status_code=500, detail="File upload failed")
     finally:
         await actual_file.close()
@@ -283,6 +343,9 @@ async def upload_note(
         "uploaded_by": current_user["id"],
         "uploader_name": current_user.get("name", "Student"),
         "file_url": secure_url,
+        "cloudinary_public_id": result.get("public_id") if cloudinary_ready else None,
+        "cloudinary_resource_type": result.get("resource_type") if cloudinary_ready else None,
+        "cloudinary_format": result.get("format") if cloudinary_ready else None,
         "file_name": actual_file.filename,
         "thumbnail_url": thumbnail_url,
         "tags": [item.strip() for item in tags.split(",") if item.strip()],
@@ -300,7 +363,6 @@ async def upload_note(
 
     return {
         "message": "Upload successful",
-        "file_url": secure_url,
         "note": serialize_note(note_doc, current_user["id"]),
     }
 
@@ -410,7 +472,11 @@ async def rate_note(note_id: str, rating: float, current_user=Depends(get_curren
 @router.post("/{note_id}/download")
 async def download_note(note_id: str, current_user=Depends(get_current_user)):
     db = get_db()
-    note = await db.notes.find_one({"_id": ObjectId(note_id)})
+    try:
+        note_object_id = ObjectId(note_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Note not found") from exc
+    note = await db.notes.find_one({"_id": note_object_id})
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
     is_unlocked = (
@@ -420,9 +486,32 @@ async def download_note(note_id: str, current_user=Depends(get_current_user)):
     )
     if not is_unlocked:
         raise HTTPException(status_code=403, detail="Note not unlocked")
-    await db.notes.update_one({"_id": ObjectId(note_id)}, {"$inc": {"downloads": 1}})
-    await db.users.update_one(
-        {"_id": ObjectId(current_user["id"])},
-        {"$inc": {"xp": 10}}
-    )
-    return {"file_url": note["file_url"], "file_name": note["file_name"]}
+    if note.get("status") != "approved" and note.get("uploaded_by") != current_user["id"]:
+        raise HTTPException(status_code=404, detail="Note not found")
+    if not note.get("file_url") and not note.get("pdf_url") and not note.get("cloudinary_public_id"):
+        raise HTTPException(status_code=404, detail="PDF is unavailable")
+    return {"file_url": f"/api/notes/{note_id}/content", "file_name": note.get("file_name") or "note.pdf"}
+
+
+@router.post("/{note_id}/download/complete")
+async def complete_note_download(note_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+    try:
+        note_object_id = ObjectId(note_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Note not found") from exc
+    note = await db.notes.find_one({"_id": note_object_id})
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    is_unlocked = (int(note.get("unlock_cost", 0) or 0) <= 0 or current_user["id"] in [str(uid) for uid in note.get("unlocked_by", [])] or note.get("uploaded_by") == current_user["id"] or current_user.get("role") == "admin")
+    if not is_unlocked:
+        raise HTTPException(status_code=403, detail="Note not unlocked")
+    try:
+        await db.note_downloads.insert_one({"note_id": note_id, "user_id": current_user["id"], "downloaded_at": datetime.now(timezone.utc)})
+        await db.notes.update_one({"_id": note_object_id}, {"$inc": {"downloads": 1}})
+        await db.users.update_one({"_id": ObjectId(current_user["id"])}, {"$inc": {"xp": 10}})
+    except Exception as exc:
+        from pymongo.errors import DuplicateKeyError
+        if not isinstance(exc, DuplicateKeyError):
+            raise
+    return {"message": "Offline download recorded"}

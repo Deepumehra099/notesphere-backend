@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from utils.db import get_db
 from utils.auth_utils import get_current_user
+from routes.notes import serialize_note
 from typing import Optional
 
 router = APIRouter(prefix="/api/search", tags=["search"])
@@ -33,13 +34,8 @@ async def search_notes(
     cursor = db.notes.find(query).sort(s[0], s[1]).skip(skip).limit(limit)
     notes = []
     async for note in cursor:
-        n = {**note}
-        n["id"] = str(n.pop("_id"))
-        n["unlocked_by"] = [str(uid) for uid in n.get("unlocked_by", [])]
-        n["is_unlocked"] = current_user["id"] in n.get("unlocked_by", []) or n.get("uploaded_by") == current_user["id"]
-        if not n["is_unlocked"] and (n.get("unlock_cost", 0) or 0) > 0:
-            n["file_url"] = ""
-            n["pdf_url"] = ""
+        n = serialize_note(note, current_user["id"])
+        n["is_unlocked"] = (n.get("price", 0) <= 0 or current_user["id"] in n.get("unlocked_by", []) or n.get("uploaded_by") == current_user["id"])
         notes.append(n)
 
     total = await db.notes.count_documents(query)
