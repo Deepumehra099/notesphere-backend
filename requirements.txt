@@ -8,6 +8,7 @@ PyJWT
 openai
 python-multipart
 cloudinary
+httpx
 PyMuPDF
 websockets
 

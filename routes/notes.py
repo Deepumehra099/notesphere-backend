@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from io import BytesIO
 from urllib.parse import urlparse
 from datetime import datetime, timezone
@@ -28,6 +29,52 @@ NOTES_UPLOADS_DIR = UPLOADS_ROOT / "notes"
 THUMBNAILS_UPLOADS_DIR = UPLOADS_ROOT / "note-thumbnails"
 NOTES_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 THUMBNAILS_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def proxy_cloudinary_pdf(url: str, headers: dict[str, str]):
+    import httpx
+
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(180.0, connect=30.0),
+    )
+    try:
+        upstream = await client.send(client.build_request("GET", url), stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        logger.warning("Cloudinary PDF request failed. error_type=%s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Could not reach PDF storage. Please retry.") from exc
+
+    if upstream.status_code != 200:
+        status = upstream.status_code
+        provider_error = upstream.headers.get("X-Cld-Error", "")
+        await upstream.aclose()
+        await client.aclose()
+        logger.warning("Cloudinary rejected PDF delivery. upstream_status=%s provider_error=%s", status, provider_error[:300])
+        if status == 401 and any(marker in provider_error.lower() for marker in ("acl deny", "pdf", "blocked", "not allowed")):
+            raise HTTPException(
+                status_code=502,
+                detail="Cloudinary is blocking PDF delivery for this account. Enable PDF delivery in Cloudinary Security settings, or re-upload the PDF after local PDF storage is enabled.",
+            )
+        raise HTTPException(status_code=502, detail=f"PDF storage returned HTTP {status}.")
+
+    response_headers = dict(headers)
+    content_length = upstream.headers.get("content-length")
+    if content_length and content_length.isdigit():
+        response_headers["Content-Length"] = content_length
+
+    async def stream_pdf():
+        try:
+            async for chunk in upstream.aiter_raw(128 * 1024):
+                yield chunk
+        except httpx.HTTPError as exc:
+            logger.warning("Cloudinary PDF stream ended early. error_type=%s", type(exc).__name__)
+            raise
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(stream_pdf(), media_type="application/pdf", headers=response_headers)
 
 def configure_cloudinary() -> bool:
     cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
@@ -220,17 +267,6 @@ async def get_note(note_id: str, current_user=Depends(get_current_user)):
     return {"note": n}
 
 
-def _stream_remote_file(url: str):
-    from urllib.request import Request, urlopen
-    request = Request(url, headers={"User-Agent": "NotesSphere/1.0"})
-    with urlopen(request, timeout=30) as response:
-        while True:
-            chunk = response.read(64 * 1024)
-            if not chunk:
-                break
-            yield chunk
-
-
 @router.get("/{note_id}/content")
 async def get_note_content(note_id: str, current_user=Depends(get_current_user)):
     try:
@@ -248,12 +284,39 @@ async def get_note_content(note_id: str, current_user=Depends(get_current_user))
     if not allowed:
         raise HTTPException(status_code=403, detail="Unlock this note before reading it")
     file_url = str(note.get("file_url") or note.get("pdf_url") or "")
-    if note.get("cloudinary_public_id"):
+    parsed = urlparse(file_url)
+    if note.get("cloudinary_public_id") or (parsed.scheme == "https" and parsed.hostname and parsed.hostname.endswith(".cloudinary.com")):
+        # Cloudinary's SDK config is process-local. Uploads configure it in the
+        # upload handler, but a restarted API process must configure it again
+        # before signing a download URL. Older note rows only contain the
+        # delivery URL, so reconstruct the public ID and sign those as well.
+        if not configure_cloudinary():
+            raise HTTPException(status_code=503, detail="PDF storage is not configured on the server")
         from cloudinary.utils import private_download_url
+        if note.get("cloudinary_public_id"):
+            public_id = note["cloudinary_public_id"]
+            resource_type = note.get("cloudinary_resource_type") or "raw"
+            file_format = note.get("cloudinary_format") or ("" if resource_type == "raw" else "pdf")
+            delivery_type = "authenticated"
+        else:
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) < 5 or parts[1] not in {"image", "video", "raw"} or parts[2] not in {"upload", "private", "authenticated"}:
+                raise HTTPException(status_code=404, detail="PDF storage URL is invalid")
+            resource_type, delivery_type = parts[1], parts[2]
+            asset_parts = parts[3:]
+            if asset_parts and re.fullmatch(r"v\d+", asset_parts[0]):
+                asset_parts = asset_parts[1:]
+            if not asset_parts:
+                raise HTTPException(status_code=404, detail="PDF storage URL is invalid")
+            file_format = ""
+            if resource_type != "raw" and "." in asset_parts[-1]:
+                asset_parts[-1], file_format = asset_parts[-1].rsplit(".", 1)
+            public_id = "/".join(asset_parts)
         file_url = private_download_url(
-            note["cloudinary_public_id"], note.get("cloudinary_format") or "pdf",
-            resource_type=note.get("cloudinary_resource_type") or "raw",
-            type="authenticated", expires_at=int(datetime.now(timezone.utc).timestamp()) + 60,
+            public_id, file_format,
+            resource_type=resource_type,
+            type=delivery_type,
+            expires_at=int(datetime.now(timezone.utc).timestamp()) + 300,
         )
     filename = Path(str(note.get("file_name") or "note.pdf")).name.replace('"', "")
     headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Content-Disposition": f'inline; filename="{filename}"'}
@@ -269,7 +332,9 @@ async def get_note_content(note_id: str, current_user=Depends(get_current_user))
     parsed = urlparse(file_url)
     if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".cloudinary.com"):
         raise HTTPException(status_code=404, detail="PDF is unavailable")
-    return StreamingResponse(_stream_remote_file(file_url), media_type="application/pdf", headers=headers)
+    # Keep the signed storage URL server-side so storage auth errors cannot be
+    # mistaken for an expired Notesphere login by the mobile client.
+    return await proxy_cloudinary_pdf(file_url, headers)
 
 @router.post("/upload")
 async def upload_note(
@@ -313,6 +378,7 @@ async def upload_note(
     thumbnail_url = ""
     result = {}
     cloudinary_ready = False
+    cloudinary_pdf_ready = False
     preview = None
     if thumbnail is None or not thumbnail.filename:
         try:
@@ -324,7 +390,9 @@ async def upload_note(
 
     try:
         cloudinary_ready = configure_cloudinary()
-        if cloudinary_ready:
+        pdf_storage = os.getenv("NOTES_PDF_STORAGE", "cloudinary").strip().lower()
+        cloudinary_pdf_ready = cloudinary_ready and pdf_storage == "cloudinary"
+        if cloudinary_pdf_ready:
             actual_file.file.seek(0)
             result = cloudinary.uploader.upload(
                 actual_file.file,
@@ -337,8 +405,22 @@ async def upload_note(
             if not secure_url:
                 raise RuntimeError("Cloudinary did not return secure_url")
             logger.info("Cloudinary upload success. user_id=%s filename=%s", current_user["id"], actual_file.filename)
+        else:
+            secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
+            logger.info("Note PDF stored locally. user_id=%s", current_user["id"])
+    except Exception as e:
+        logger.warning("Primary note upload failed; using local storage fallback. error_type=%s", type(e).__name__)
+        result = {}
+        cloudinary_pdf_ready = False
+        try:
+            secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
+        except Exception as local_error:
+            logger.error("Local note upload fallback failed. error_type=%s", type(local_error).__name__)
+            raise HTTPException(status_code=500, detail="File upload failed")
 
-            if thumbnail is not None and thumbnail.filename:
+    if thumbnail is not None and thumbnail.filename:
+        if cloudinary_ready:
+            try:
                 thumbnail.file.seek(0)
                 thumbnail_result = cloudinary.uploader.upload(
                     thumbnail.file,
@@ -346,36 +428,26 @@ async def upload_note(
                     folder="notesphere/note-thumbnails",
                 )
                 thumbnail_url = thumbnail_result.get("secure_url", "").strip()
-            elif preview:
+            except Exception as exc:
+                logger.warning("Thumbnail Cloudinary upload failed; using local storage. error_type=%s", type(exc).__name__)
+        if not thumbnail_url:
+            thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
+    elif preview:
+        if cloudinary_ready:
+            try:
                 thumbnail_result = cloudinary.uploader.upload(
                     BytesIO(preview),
                     resource_type="image",
                     folder="notesphere/note-thumbnails",
                 )
                 thumbnail_url = thumbnail_result.get("secure_url", "").strip()
-        else:
-            secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
-            if thumbnail is not None and thumbnail.filename:
-                thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
-            elif preview:
-                thumbnail_url = save_preview_locally(preview, f"thumb_{current_user['id']}")
-    except Exception as e:
-        logger.warning("Primary note upload failed; using local storage fallback. error_type=%s", type(e).__name__)
-        result = {}
-        cloudinary_ready = False
-        try:
-            secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
-            if thumbnail is not None and thumbnail.filename and not thumbnail_url:
-                thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
-            elif preview and not thumbnail_url:
-                thumbnail_url = save_preview_locally(preview, f"thumb_{current_user['id']}")
-        except Exception as local_error:
-            logger.error("Local note upload fallback failed. error_type=%s", type(local_error).__name__)
-            raise HTTPException(status_code=500, detail="File upload failed")
-    finally:
-        await actual_file.close()
-        if thumbnail is not None:
-            await thumbnail.close()
+            except Exception as exc:
+                logger.warning("PDF preview Cloudinary upload failed; using local storage. error_type=%s", type(exc).__name__)
+        if not thumbnail_url:
+            thumbnail_url = save_preview_locally(preview, f"thumb_{current_user['id']}")
+    await actual_file.close()
+    if thumbnail is not None:
+        await thumbnail.close()
 
     db = get_db()
     note_doc = {
@@ -389,9 +461,9 @@ async def upload_note(
         "uploaded_by": current_user["id"],
         "uploader_name": current_user.get("name", "Student"),
         "file_url": secure_url,
-        "cloudinary_public_id": result.get("public_id") if cloudinary_ready else None,
-        "cloudinary_resource_type": result.get("resource_type") if cloudinary_ready else None,
-        "cloudinary_format": result.get("format") if cloudinary_ready else None,
+        "cloudinary_public_id": result.get("public_id") if cloudinary_pdf_ready else None,
+        "cloudinary_resource_type": result.get("resource_type") if cloudinary_pdf_ready else None,
+        "cloudinary_format": result.get("format") if cloudinary_pdf_ready else None,
         "file_name": actual_file.filename,
         "thumbnail_url": thumbnail_url,
         "tags": [item.strip() for item in tags.split(",") if item.strip()],

@@ -8,6 +8,8 @@ import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timezone
 
+import jwt
+
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -15,6 +17,8 @@ from pymongo.errors import DuplicateKeyError
 
 from utils.auth_utils import (
     create_access_token,
+    create_refresh_token,
+    get_jwt_secret,
     get_current_user,
     hash_password,
     verify_password,
@@ -42,6 +46,10 @@ class RegisterInput(BaseModel):
 class LoginInput(BaseModel):
     email: str
     password: str
+
+
+class RefreshInput(BaseModel):
+    refresh_token: str
 
 
 @router.get("/username-availability")
@@ -268,6 +276,7 @@ async def register(data: RegisterInput):
     return {
         "message": "User registered successfully",
         "access_token": create_access_token(str(result.inserted_id), email),
+        "refresh_token": create_refresh_token(str(result.inserted_id)),
         "user": serialize_user(user_doc, wallet),
     }
 
@@ -421,7 +430,32 @@ async def login(data: LoginInput):
     return {
         "message": "Login successful",
         "access_token": create_access_token(str(user["_id"]), user["email"]),
+        "refresh_token": create_refresh_token(str(user["_id"])),
         "user": serialize_user(user, wallet),
+    }
+
+
+@router.post("/refresh")
+async def refresh_session(data: RefreshInput):
+    try:
+        payload = jwt.decode(data.refresh_token, get_jwt_secret(), algorithms=["HS256"])
+        if payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+        user_id = str(ObjectId(payload["sub"]))
+    except HTTPException:
+        raise
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Refresh session expired. Please sign in again.")
+
+    user = await get_db().users.find_one({"_id": ObjectId(user_id)})
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    if user.get("is_banned"):
+        raise HTTPException(status_code=403, detail="Your account has been banned")
+
+    return {
+        "access_token": create_access_token(user_id, user.get("email", "")),
+        "refresh_token": create_refresh_token(user_id),
     }
 
 
