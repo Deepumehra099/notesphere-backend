@@ -648,7 +648,15 @@ async def get_chat_rooms(current_user=Depends(get_current_user)):
 @router.get("/ice-servers")
 async def get_ice_servers(current_user=Depends(get_current_user)):
     servers = [{"urls": "stun:stun.l.google.com:19302"}]
-    turn_urls = [url.strip() for url in os.getenv("TURN_URLS", "").split(",") if url.strip()]
+    turn_urls = []
+    for raw_url in os.getenv("TURN_URLS", "").split(","):
+        url = raw_url.strip().lower()
+        if not url:
+            continue
+        if not re.fullmatch(r"(?:stun|stuns|turn|turns):[^\s,]+", url):
+            logger.warning("Ignoring malformed ICE server URL from TURN_URLS")
+            continue
+        turn_urls.append(url)
     if turn_urls:
         turn_server = {"urls": turn_urls}
         username = os.getenv("TURN_USERNAME", "").strip()
