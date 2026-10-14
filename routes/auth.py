@@ -349,9 +349,8 @@ async def login(data: LoginInput):
     username = identifier.removeprefix("@").lower()
     admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
     admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
-    is_configured_admin_login = bool(
-        admin_email and admin_password and email == admin_email and data.password == admin_password
-    )
+    configured_admin_password_matches = bool(admin_email and admin_password and data.password == admin_password)
+    is_configured_admin_login = bool(configured_admin_password_matches and email == admin_email)
 
     user = await users.find_one({"$or": [
         {"email": email},
@@ -400,6 +399,11 @@ async def login(data: LoginInput):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user = await ensure_user_uid(users, user)
+    # Allow the configured owner to sign in by username as well as email.
+    # Match the username-resolved account to ADMIN_EMAIL before trusting the
+    # configured password for admin recovery.
+    if configured_admin_password_matches and str(user.get("email", "")).strip().lower() == admin_email:
+        is_configured_admin_login = True
 
     password_hash = user.get("password_hash")
     password_matches = False
