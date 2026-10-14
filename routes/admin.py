@@ -13,6 +13,7 @@ from utils.auth_utils import get_current_user
 from utils.db import get_client, get_db
 from utils.wallets import credit_wallet, debit_wallet, ensure_wallet, release_held_funds
 from utils.credits import apply_credit_change, get_credit_settings, qualify_referral
+from routes.notes import delete_note_assets
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -455,9 +456,12 @@ async def reject_note_put_alias(note_id: str, admin=Depends(require_admin)):
 @router.delete("/notes/{note_id}")
 async def delete_note(note_id: str, admin=Depends(require_admin)):
     db = get_db()
-    result = await db.notes.delete_one({"_id": parse_object_id(note_id, "Note not found")})
-    if result.deleted_count == 0:
+    object_id = parse_object_id(note_id, "Note not found")
+    note = await db.notes.find_one({"_id": object_id})
+    if not note:
         raise HTTPException(status_code=404, detail="Note not found")
+    await db.notes.delete_one({"_id": object_id})
+    await delete_note_assets(note)
     return {"message": "Note deleted"}
 
 

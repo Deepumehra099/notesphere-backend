@@ -150,6 +150,55 @@ def serialize_note(note, viewer_id: str | None = None):
         n["unlocked_by"] = [str(uid) for uid in n.get("unlocked_by", [])]
     return n
 
+
+async def delete_note_assets(note: dict) -> None:
+    """Best-effort cleanup for local uploads and known Cloudinary assets."""
+    root = UPLOADS_ROOT.resolve()
+
+    def remove_local(url: str) -> None:
+        if not url:
+            return
+        path = urlparse(str(url)).path
+        if path.startswith("/api/uploads/"):
+            path = path.removeprefix("/api")
+        if not path.startswith("/uploads/"):
+            return
+        target = (UPLOADS_ROOT / path.removeprefix("/uploads/")).resolve()
+        if target.is_relative_to(root) and target.is_file():
+            target.unlink()
+
+    for url in (note.get("file_url"), note.get("pdf_url"), note.get("thumbnail_url")):
+        remove_local(str(url or ""))
+
+    cloudinary_assets = []
+    public_id = str(note.get("cloudinary_public_id") or "").strip()
+    if public_id:
+        cloudinary_assets.append((
+            public_id,
+            str(note.get("cloudinary_resource_type") or "raw"),
+            "authenticated",
+        ))
+
+    thumbnail_url = str(note.get("thumbnail_url") or "")
+    parsed_thumbnail = urlparse(thumbnail_url)
+    if parsed_thumbnail.hostname and parsed_thumbnail.hostname.endswith(".cloudinary.com"):
+        parts = parsed_thumbnail.path.strip("/").split("/")
+        if len(parts) >= 5 and parts[0] == "image" and parts[1] in {"upload", "private", "authenticated"}:
+            asset_parts = parts[2:]
+            if asset_parts and re.fullmatch(r"v\d+", asset_parts[0]):
+                asset_parts = asset_parts[1:]
+            if asset_parts and "." in asset_parts[-1]:
+                asset_parts[-1] = asset_parts[-1].rsplit(".", 1)[0]
+            if asset_parts:
+                cloudinary_assets.append(("/".join(asset_parts), "image", parts[1]))
+
+    if cloudinary_assets and configure_cloudinary():
+        for asset_id, resource_type, delivery_type in cloudinary_assets:
+            try:
+                cloudinary.uploader.destroy(asset_id, resource_type=resource_type, type=delivery_type)
+            except Exception as exc:
+                logger.warning("Could not remove note storage asset. error_type=%s", type(exc).__name__)
+
 @router.get("/feed")
 async def get_notes_feed(
     page: int = 1,
@@ -225,6 +274,20 @@ async def get_my_notes(current_user=Depends(get_current_user)):
     async for note in cursor:
         notes.append(serialize_note(note, current_user["id"]))
     return {"notes": notes}
+
+
+@router.delete("/mine/{note_id}")
+async def delete_my_note(note_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+    note_object_id = ObjectId(note_id) if ObjectId.is_valid(note_id) else None
+    if note_object_id is None:
+        raise HTTPException(status_code=404, detail="Note not found")
+    note = await db.notes.find_one({"_id": note_object_id, "uploaded_by": current_user["id"]})
+    if not note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    await db.notes.delete_one({"_id": note_object_id, "uploaded_by": current_user["id"]})
+    await delete_note_assets(note)
+    return {"message": "Your note was deleted"}
 
 
 @router.get("/purchased")

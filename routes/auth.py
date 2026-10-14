@@ -83,7 +83,9 @@ def _send_password_reset_email(email: str, otp: str) -> None:
     host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     port = int(os.getenv("SMTP_PORT", "465"))
     username = os.getenv("SMTP_USER", os.getenv("EMAIL_USER", ""))
-    password = os.getenv("SMTP_PASSWORD", os.getenv("EMAIL_PASS", ""))
+    # Google displays App Passwords grouped with spaces (xxxx xxxx xxxx xxxx).
+    # SMTP authentication expects the raw 16-character value.
+    password = "".join(os.getenv("SMTP_PASSWORD", os.getenv("EMAIL_PASS", "")).split())
     sender = os.getenv("SMTP_FROM", username)
     if not username or not password or not sender:
         raise RuntimeError("Email delivery is not configured. Set SMTP_USER and SMTP_PASSWORD in backend/.env")
