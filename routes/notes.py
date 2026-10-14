@@ -2,7 +2,7 @@ import logging
 import os
 import re
 from io import BytesIO
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -80,6 +80,16 @@ def configure_cloudinary() -> bool:
     cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip()
     api_key = os.getenv("CLOUDINARY_API_KEY", "").strip()
     api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip()
+
+    # Render and other hosts often expose Cloudinary as one CLOUDINARY_URL
+    # variable. Accept that standard format as well as the split variables.
+    cloudinary_url = os.getenv("CLOUDINARY_URL", "").strip()
+    if (not cloud_name or not api_key or not api_secret) and cloudinary_url:
+        parsed = urlparse(cloudinary_url)
+        if parsed.scheme == "cloudinary" and parsed.hostname and parsed.username and parsed.password:
+            cloud_name = unquote(parsed.hostname)
+            api_key = unquote(parsed.username)
+            api_secret = unquote(parsed.password)
 
     if api_key.startswith("cloudinary://"):
         logger.warning("Invalid Cloudinary configuration detected, falling back to local uploads")
