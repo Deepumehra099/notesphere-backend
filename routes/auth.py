@@ -399,10 +399,13 @@ async def login(data: LoginInput):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     user = await ensure_user_uid(users, user)
+    is_configured_admin_account = bool(
+        admin_email and str(user.get("email", "")).strip().lower() == admin_email
+    )
     # Allow the configured owner to sign in by username as well as email.
     # Match the username-resolved account to ADMIN_EMAIL before trusting the
     # configured password for admin recovery.
-    if configured_admin_password_matches and str(user.get("email", "")).strip().lower() == admin_email:
+    if configured_admin_password_matches and is_configured_admin_account:
         is_configured_admin_login = True
 
     password_hash = user.get("password_hash")
@@ -420,6 +423,16 @@ async def login(data: LoginInput):
     if user.get("is_banned") and is_configured_admin_login:
         # Recover the configured owner/admin account if it was accidentally
         # banned from the admin user list. Env credentials remain authoritative.
+        await users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"is_banned": False, "is_admin": True, "role": "admin"}},
+        )
+        user["is_banned"] = False
+        user["is_admin"] = True
+        user["role"] = "admin"
+    elif user.get("is_banned") and is_configured_admin_account and password_matches:
+        # Recover only the configured owner account when its stored password
+        # is valid but Render's ADMIN_PASSWORD has not yet been synchronized.
         await users.update_one(
             {"_id": user["_id"]},
             {"$set": {"is_banned": False, "is_admin": True, "role": "admin"}},
