@@ -7,7 +7,6 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from pymongo import ASCENDING, DESCENDING
 
 from routes.ai import router as ai_router
@@ -80,34 +79,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/uploads", ProtectedUploadsStaticFiles(directory=str(uploads_dir)), name="uploads")
-
-# =========================
-# 🔐 ADMIN LOGIN MODEL
-# =========================
-class AdminLogin(BaseModel):
-    email: str
-    password: str
-
-
-# =========================
-# 🔐 ADMIN LOGIN API
-# =========================
-@app.post("/admin-login")
-def admin_login(data: AdminLogin):
-    admin_email = os.getenv("ADMIN_EMAIL")
-    admin_password = os.getenv("ADMIN_PASSWORD")
-
-    if not admin_email or not admin_password:
-        raise HTTPException(status_code=500, detail="Admin credentials not set")
-
-    if data.email == admin_email and data.password == admin_password:
-        return {
-            "success": True,
-            "message": "Admin login successful"
-        }
-    else:
-        raise HTTPException(status_code=401, detail="Invalid admin credentials")
-
 
 # =========================
 # ROUTES

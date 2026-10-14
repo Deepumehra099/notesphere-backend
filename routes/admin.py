@@ -385,6 +385,14 @@ async def get_pending_notes(admin=Depends(require_admin)):
     return await get_notes(status="pending", admin=admin)
 
 
+@router.get("/notes/{note_id}/content")
+async def get_admin_note_content(note_id: str, admin=Depends(require_admin)):
+    """Serve note PDFs to verified admins, including notes awaiting approval."""
+    from routes.notes import get_note_content
+
+    return await get_note_content(note_id, current_user=admin)
+
+
 @router.get("/notes/pending")
 async def get_pending_notes_compat(admin=Depends(require_admin)):
     return await get_notes(status="pending", admin=admin)
