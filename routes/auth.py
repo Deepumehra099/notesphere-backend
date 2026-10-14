@@ -349,12 +349,15 @@ async def login(data: LoginInput):
     username = identifier.removeprefix("@").lower()
     admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
     admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+    is_configured_admin_login = bool(
+        admin_email and admin_password and email == admin_email and data.password == admin_password
+    )
 
     user = await users.find_one({"$or": [
         {"email": email},
         {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}},
     ]})
-    if not user and admin_email and admin_password and email == admin_email and data.password == admin_password:
+    if not user and is_configured_admin_login:
         admin_doc = {
             "uid": await generate_unique_uid(users),
             "name": os.getenv("ADMIN_NAME", "Admin").strip() or "Admin",
@@ -400,7 +403,7 @@ async def login(data: LoginInput):
 
     password_hash = user.get("password_hash")
     password_matches = False
-    if admin_email and admin_password and email == admin_email and data.password == admin_password:
+    if is_configured_admin_login:
         password_matches = True
     else:
         password_matches = (
@@ -410,7 +413,17 @@ async def login(data: LoginInput):
         )
     if not password_matches:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if user.get("is_banned"):
+    if user.get("is_banned") and is_configured_admin_login:
+        # Recover the configured owner/admin account if it was accidentally
+        # banned from the admin user list. Env credentials remain authoritative.
+        await users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"is_banned": False, "is_admin": True, "role": "admin"}},
+        )
+        user["is_banned"] = False
+        user["is_admin"] = True
+        user["role"] = "admin"
+    elif user.get("is_banned"):
         raise HTTPException(status_code=403, detail="Your account has been banned")
 
     if not password_hash and user.get("password"):

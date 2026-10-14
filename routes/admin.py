@@ -296,7 +296,12 @@ async def ban_or_unban_user(user_id: str, admin=Depends(require_admin)):
     user = await db.users.find_one({"_id": object_id})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    next_state = not bool(user.get("is_banned", False))
+    is_admin_account = bool(user.get("is_admin") or user.get("role") == "admin")
+    is_currently_banned = bool(user.get("is_banned", False))
+    if is_admin_account and not is_currently_banned:
+        raise HTTPException(status_code=403, detail="Admin accounts cannot be blocked")
+    # An already-blocked admin can only be restored, never blocked further.
+    next_state = False if is_admin_account else not is_currently_banned
     await db.users.update_one(
         {"_id": object_id},
         {"$set": {"is_banned": next_state}},
