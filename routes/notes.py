@@ -1,5 +1,6 @@
 import logging
 import os
+from io import BytesIO
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,25 @@ async def save_upload_locally(upload: UploadFile, directory: Path, prefix: str) 
                 break
             output.write(chunk)
     return f"/uploads/{directory.name}/{safe_name}"
+
+
+def make_pdf_preview(upload: UploadFile) -> bytes:
+    import fitz
+
+    upload.file.seek(0)
+    pdf_bytes = upload.file.read()
+    upload.file.seek(0)
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
+        if not document.page_count:
+            raise ValueError("PDF has no pages")
+        page = document.load_page(0)
+        return page.get_pixmap(matrix=fitz.Matrix(1.4, 1.4), alpha=False).tobytes("png")
+
+
+def save_preview_locally(preview: bytes, prefix: str) -> str:
+    filename = f"{prefix}_{uuid4().hex}.png"
+    (THUMBNAILS_UPLOADS_DIR / filename).write_bytes(preview)
+    return f"/uploads/{THUMBNAILS_UPLOADS_DIR.name}/{filename}"
 
 def serialize_note(note, viewer_id: str | None = None):
     n = {**note}
@@ -221,9 +241,10 @@ async def get_note_content(note_id: str, current_user=Depends(get_current_user))
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
     user_id = current_user["id"]
-    if note.get("status") != "approved" and note.get("uploaded_by") != user_id and current_user.get("role") != "admin":
+    is_admin = bool(current_user.get("is_admin") or current_user.get("role") == "admin")
+    if note.get("status") != "approved" and note.get("uploaded_by") != user_id and not is_admin:
         raise HTTPException(status_code=404, detail="Note not found")
-    allowed = (int(note.get("unlock_cost", 0) or 0) <= 0 or note.get("uploaded_by") == user_id or user_id in [str(value) for value in note.get("unlocked_by", [])] or current_user.get("role") == "admin")
+    allowed = (int(note.get("unlock_cost", 0) or 0) <= 0 or note.get("uploaded_by") == user_id or user_id in [str(value) for value in note.get("unlocked_by", [])] or is_admin)
     if not allowed:
         raise HTTPException(status_code=403, detail="Unlock this note before reading it")
     file_url = str(note.get("file_url") or note.get("pdf_url") or "")
@@ -236,9 +257,13 @@ async def get_note_content(note_id: str, current_user=Depends(get_current_user))
         )
     filename = Path(str(note.get("file_name") or "note.pdf")).name.replace('"', "")
     headers = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "Content-Disposition": f'inline; filename="{filename}"'}
-    if file_url.startswith("/uploads/notes/"):
-        target = (UPLOADS_ROOT / file_url.removeprefix("/uploads/")).resolve()
-        if not target.is_relative_to(NOTES_UPLOADS_DIR.resolve()) or not target.is_file():
+    local_path = urlparse(file_url).path
+    if local_path.startswith("/api/uploads/"):
+        local_path = local_path.removeprefix("/api")
+    if local_path.startswith("/uploads/"):
+        target = (UPLOADS_ROOT / local_path.removeprefix("/uploads/")).resolve()
+        if not target.is_relative_to(UPLOADS_ROOT.resolve()) or not target.is_file():
+            logger.warning("Local note PDF is missing. note_id=%s path=%s", note_id, local_path)
             raise HTTPException(status_code=404, detail="PDF is unavailable")
         return FileResponse(target, media_type="application/pdf", headers=headers, filename=None)
     parsed = urlparse(file_url)
@@ -278,14 +303,22 @@ async def upload_note(
 
     raw_price = price if price not in (None, "") else unlock_cost
     if raw_price in (None, ""):
-        from utils.credits import get_credit_settings
-        raw_price = (await get_credit_settings(db)).get("premium_note_price", 0)
+        raw_price = 0
     try:
-        final_price = max(0, int(raw_price or 0))
+        final_price = int(raw_price or 0)
     except (TypeError, ValueError):
-        final_price = 0
+        raise HTTPException(status_code=400, detail="Price must be a whole number of Credits")
+    if final_price < 0:
+        raise HTTPException(status_code=400, detail="Price cannot be negative")
     thumbnail_url = ""
     result = {}
+    cloudinary_ready = False
+    preview = None
+    if thumbnail is None or not thumbnail.filename:
+        try:
+            preview = make_pdf_preview(actual_file)
+        except Exception as exc:
+            logger.warning("Could not generate PDF preview. filename=%s error_type=%s", actual_file.filename, type(exc).__name__)
 
     public_id = f"notesphere/notes/{current_user['id']}_{int(datetime.now().timestamp())}"
 
@@ -313,16 +346,29 @@ async def upload_note(
                     folder="notesphere/note-thumbnails",
                 )
                 thumbnail_url = thumbnail_result.get("secure_url", "").strip()
+            elif preview:
+                thumbnail_result = cloudinary.uploader.upload(
+                    BytesIO(preview),
+                    resource_type="image",
+                    folder="notesphere/note-thumbnails",
+                )
+                thumbnail_url = thumbnail_result.get("secure_url", "").strip()
         else:
             secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
             if thumbnail is not None and thumbnail.filename:
                 thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
+            elif preview:
+                thumbnail_url = save_preview_locally(preview, f"thumb_{current_user['id']}")
     except Exception as e:
         logger.warning("Primary note upload failed; using local storage fallback. error_type=%s", type(e).__name__)
+        result = {}
+        cloudinary_ready = False
         try:
             secure_url = await save_upload_locally(actual_file, NOTES_UPLOADS_DIR, f"note_{current_user['id']}")
             if thumbnail is not None and thumbnail.filename and not thumbnail_url:
                 thumbnail_url = await save_upload_locally(thumbnail, THUMBNAILS_UPLOADS_DIR, f"thumb_{current_user['id']}")
+            elif preview and not thumbnail_url:
+                thumbnail_url = save_preview_locally(preview, f"thumb_{current_user['id']}")
         except Exception as local_error:
             logger.error("Local note upload fallback failed. error_type=%s", type(local_error).__name__)
             raise HTTPException(status_code=500, detail="File upload failed")

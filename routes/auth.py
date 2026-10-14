@@ -3,12 +3,13 @@ import secrets
 import string
 import hashlib
 import hmac
+import re
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timezone
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 
@@ -27,6 +28,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 class RegisterInput(BaseModel):
     name: str
+    username: str = ""
     email: str
     password: str
     phone: str = ""
@@ -40,6 +42,18 @@ class RegisterInput(BaseModel):
 class LoginInput(BaseModel):
     email: str
     password: str
+
+
+@router.get("/username-availability")
+async def username_availability(username: str = Query(..., min_length=3, max_length=25)):
+    username = username.strip().removeprefix("@").lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,24}", username):
+        raise HTTPException(status_code=400, detail="Username must be 3–24 characters and use only letters, numbers, or underscores")
+    existing = await get_db().users.find_one(
+        {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}},
+        {"_id": 1},
+    )
+    return {"available": existing is None}
 
 
 class ForgotPasswordInput(BaseModel):
@@ -90,6 +104,7 @@ def serialize_user(user: dict, wallet: dict | None = None) -> dict:
         "id": str(user.get("_id", user.get("id", ""))),
         "uid": user.get("uid", ""),
         "name": user.get("name", ""),
+        "username": user.get("username", ""),
         "email": user.get("email", ""),
         "role": "admin" if is_admin else user.get("role", "user"),
         "is_admin": is_admin,
@@ -151,10 +166,17 @@ async def register(data: RegisterInput):
     db = get_db()
     users = db["users"]
     email = data.email.strip().lower()
+    username = data.username.strip().removeprefix("@").lower()
+
+    if username and not re.fullmatch(r"[a-z0-9_]{3,24}", username):
+        raise HTTPException(status_code=400, detail="Username must be 3–24 characters and use only letters, numbers, or underscores")
 
     existing = await users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already exists")
+
+    if username and await users.find_one({"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}}, {"_id": 1}):
+        raise HTTPException(status_code=400, detail="Username is already taken")
 
     referrer = None
     referral_code = data.referral_code.strip().upper()
@@ -172,8 +194,11 @@ async def register(data: RegisterInput):
     else:
         raise HTTPException(status_code=500, detail="Unable to create a referral code")
 
+    uid = await generate_unique_uid(users)
+    username_base = "".join(character.lower() if character.isalnum() else "_" for character in data.name.strip()).strip("_")[:28] or "user"
     user_doc = {
-        "uid": await generate_unique_uid(users),
+        "uid": uid,
+        "username": username or f"{username_base}_{uid.lower()}",
         "name": data.name.strip(),
         "email": email,
         "password_hash": hash_password(data.password),
@@ -308,11 +333,16 @@ async def reset_password(data: ResetPasswordInput):
 async def login(data: LoginInput):
     db = get_db()
     users = db["users"]
-    email = data.email.strip().lower()
+    identifier = data.email.strip()
+    email = identifier.lower()
+    username = identifier.removeprefix("@").lower()
     admin_email = os.getenv("ADMIN_EMAIL", "").strip().lower()
     admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
 
-    user = await users.find_one({"email": email})
+    user = await users.find_one({"$or": [
+        {"email": email},
+        {"username": {"$regex": f"^{re.escape(username)}$", "$options": "i"}},
+    ]})
     if not user and admin_email and admin_password and email == admin_email and data.password == admin_password:
         admin_doc = {
             "uid": await generate_unique_uid(users),

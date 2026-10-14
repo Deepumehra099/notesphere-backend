@@ -179,6 +179,13 @@ async def ensure_indexes():
     await db.reports.create_index([("reported_by", ASCENDING), ("created_at", DESCENDING)])
     await db.users.create_index([("email", ASCENDING)], unique=True)
     await db.users.create_index([("uid", ASCENDING)], unique=True)
+    # Existing deployments may already have the sparse username_1 index.
+    # Usernames generated at registration include the unique UID suffix, so a
+    # non-unique index is sufficient for search and stays migration-safe.
+    await db.users.create_index([("username", ASCENDING)], sparse=True)
+    await db.follows.create_index([("follower_id", ASCENDING), ("following_id", ASCENDING)], unique=True)
+    await db.follows.create_index([("following_id", ASCENDING), ("created_at", DESCENDING)])
+    await db.follows.create_index([("follower_id", ASCENDING), ("created_at", DESCENDING)])
     await db.users.update_many(
         {"$or": [{"credits_balance": {"$exists": False}}, {"credits_balance": None}]},
         {"$set": {"credits_balance": 0}},

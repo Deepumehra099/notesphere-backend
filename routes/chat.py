@@ -17,6 +17,7 @@ from pymongo import ReturnDocument
 
 from utils.auth_utils import get_current_user, get_jwt_secret
 from utils.db import get_db
+from utils.push_notifications import send_push_notification
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
@@ -73,12 +74,14 @@ SUSPICIOUS_TEXT_PATTERNS = [
 class ConnectionManager:
     def __init__(self):
         self.active: dict[str, set[WebSocket]] = {}
+        self.active_chats: dict[str, dict[WebSocket, str | None]] = {}
 
     async def connect(self, user_id: str, ws: WebSocket):
         await ws.accept()
         user_connections = self.active.setdefault(user_id, set())
         was_offline = len(user_connections) == 0
         user_connections.add(ws)
+        self.active_chats.setdefault(user_id, {})[ws] = None
         return was_offline
 
     def disconnect(self, user_id: str, ws: WebSocket):
@@ -86,6 +89,10 @@ class ConnectionManager:
         if not user_connections:
             return False
         user_connections.discard(ws)
+        chat_connections = self.active_chats.get(user_id, {})
+        chat_connections.pop(ws, None)
+        if not chat_connections:
+            self.active_chats.pop(user_id, None)
         if user_connections:
             return False
         self.active.pop(user_id, None)
@@ -112,6 +119,13 @@ class ConnectionManager:
     def active_user_ids(self) -> list[str]:
         return list(self.active.keys())
 
+    def set_active_chat(self, user_id: str, ws: WebSocket, chat_id: str | None):
+        if ws in self.active_chats.get(user_id, {}):
+            self.active_chats[user_id][ws] = chat_id
+
+    def is_viewing_chat(self, user_id: str, chat_id: str) -> bool:
+        return chat_id in self.active_chats.get(user_id, {}).values()
+
 
 manager = ConnectionManager()
 
@@ -127,6 +141,21 @@ class EditMessageInput(BaseModel):
 
 class ReactionInput(BaseModel):
     emoji: str = Field(..., min_length=1, max_length=8)
+
+
+class ChatThemeInput(BaseModel):
+    theme: str = Field(..., pattern="^(default|ocean|purple|sunset|dark|amoled)$")
+
+
+class ChatMuteInput(BaseModel):
+    muted: bool
+
+
+class DisappearingMessagesInput(BaseModel):
+    seconds: int
+
+
+DISAPPEARING_DURATIONS = {0, 86_400, 604_800, 7_776_000}
 
 
 def parse_object_id(value: str, detail: str = "Chat not found") -> ObjectId:
@@ -194,6 +223,14 @@ def serialize_chat(chat: dict):
     return c
 
 
+def serialize_datetime(value):
+    if not isinstance(value, datetime):
+        return value or ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
 def serialize_message(message: dict, current_user_id: str | None = None) -> dict:
     hidden_for = message.get("hidden_for", [])
     current_user_deleted = current_user_id in hidden_for if current_user_id else False
@@ -210,9 +247,10 @@ def serialize_message(message: dict, current_user_id: str | None = None) -> dict
         "mimeType": message.get("mime_type", ""),
         "senderId": message.get("sender_id", ""),
         "senderName": message.get("sender_name", ""),
-        "createdAt": message.get("created_at").isoformat() if isinstance(message.get("created_at"), datetime) else message.get("created_at", ""),
+        "createdAt": serialize_datetime(message.get("created_at")),
         "status": message.get("status", "sent"),
         "isEdited": bool(message.get("is_edited", False)),
+        "expiresAt": serialize_datetime(message.get("expires_at")),
         "isDeleted": deleted_for_everyone,
         "deleted_for_everyone": deleted_for_everyone,
         "deletedForCurrentUser": current_user_deleted,
@@ -278,10 +316,15 @@ async def update_chat_preview(db, chat_id: str):
     if latest_visible:
         last_message = get_chat_preview_text(latest_visible)
         last_message_at = latest_visible.get("created_at", datetime.now(timezone.utc))
+        last_message_sender_id = latest_visible.get("sender_id", "")
     else:
         last_message = ""
         last_message_at = datetime.now(timezone.utc)
-    await db.chats.update_one({"_id": ObjectId(chat_id)}, {"$set": {"last_message": last_message, "last_message_at": last_message_at}})
+        last_message_sender_id = ""
+    await db.chats.update_one(
+        {"_id": ObjectId(chat_id)},
+        {"$set": {"last_message": last_message, "last_message_at": last_message_at, "last_message_sender_id": last_message_sender_id}},
+    )
 
 
 async def broadcast_message_event(chat: dict, event_type: str, message: dict):
@@ -313,6 +356,8 @@ async def create_message(
 ):
     created_at = datetime.now(timezone.utc)
     status = "delivered" if receiver_id in manager.active else "sent"
+    chat_settings = await db.chats.find_one({"_id": ObjectId(chat_id)}, {"disappearing_seconds": 1}) or {}
+    disappearing_seconds = int(chat_settings.get("disappearing_seconds", 0) or 0)
     flag_reason = get_suspicious_flag_reason(text)
     msg_doc = {
         "chat_id": chat_id,
@@ -326,6 +371,7 @@ async def create_message(
         "file_name": file_name,
         "mime_type": mime_type,
         "created_at": created_at,
+        **({"expires_at": created_at + timedelta(seconds=disappearing_seconds)} if disappearing_seconds > 0 else {}),
         "status": status,
         "is_edited": False,
         "is_deleted": False,
@@ -339,8 +385,17 @@ async def create_message(
     msg_doc["_id"] = result.inserted_id
     await db.chats.update_one(
         {"_id": ObjectId(chat_id)},
-        {"$set": {"last_message": get_chat_preview_text(msg_doc), "last_message_at": created_at}},
+        {"$set": {"last_message": get_chat_preview_text(msg_doc), "last_message_at": created_at, "last_message_sender_id": sender_id}},
     )
+    chat = await db.chats.find_one({"_id": ObjectId(chat_id)}, {"muted_for": 1}) or {}
+    receiver = await db.users.find_one({"_id": ObjectId(receiver_id)}, {"notification_preferences.messages": 1}) or {}
+    muted = receiver_id in [str(item) for item in chat.get("muted_for", [])]
+    notifications_enabled = (receiver.get("notification_preferences") or {}).get("messages", True)
+    if notifications_enabled and not muted and not manager.is_viewing_chat(receiver_id, chat_id):
+        sender = await db.users.find_one({"_id": ObjectId(sender_id)}, {"avatar_url": 1, "avatar": 1})
+        preview = get_chat_preview_text(msg_doc)[:240]
+        await db.notifications.insert_one({"user_id": receiver_id, "sender_id": sender_id, "sender_avatar": (sender or {}).get("avatar_url") or (sender or {}).get("avatar", ""), "type": "message", "title": sender_name, "message": preview, "reference_id": chat_id, "read": False, "created_at": created_at})
+        await send_push_notification(db, receiver_id, sender_name, preview, {"type": "message", "chatId": chat_id})
     return msg_doc
 
 
@@ -353,7 +408,7 @@ async def broadcast_presence(user_id: str, is_online: bool, last_seen_at: dateti
                 "type": "presence",
                 "userId": user_id,
                 "isOnline": is_online,
-                "lastSeenAt": last_seen_at.isoformat() if last_seen_at else None,
+                "lastSeenAt": serialize_datetime(last_seen_at) if last_seen_at else None,
             },
         )
 
@@ -376,6 +431,10 @@ async def handle_chat_socket(ws: WebSocket):
     db = get_db()
     became_online = await manager.connect(user_id, ws)
     if became_online:
+        await db.users.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"last_seen_at": datetime.now(timezone.utc)}},
+        )
         # Reconnect delivers messages queued while this user was offline.
         user_chats = db.chats.find({"participants": user_id}, {"_id": 1})
         chat_ids = [str(chat["_id"]) async for chat in user_chats]
@@ -407,14 +466,57 @@ async def handle_chat_socket(ws: WebSocket):
     try:
         while True:
             payload = await ws.receive_json()
+            if payload.get("type") == "active_chat":
+                chat_id = str(payload.get("chatId", "")).strip()
+                if not chat_id:
+                    manager.set_active_chat(user_id, ws, None)
+                    continue
+                try:
+                    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participants": user_id})
+                except Exception:
+                    chat = None
+                manager.set_active_chat(user_id, ws, chat_id if chat else None)
+                continue
+            if payload.get("type") == "call_signal":
+                chat_id = str(payload.get("chatId", "")).strip()
+                receiver_id = str(payload.get("receiverId", "")).strip()
+                signal_type = str(payload.get("signalType", "")).strip()
+                call_type = str(payload.get("callType", "audio")).strip()
+                signal = payload.get("signal")
+                if signal_type not in {"offer", "answer", "ice", "end", "reject"} or call_type not in {"audio", "video"}:
+                    continue
+                try:
+                    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "context_type": "direct"})
+                except Exception:
+                    chat = None
+                participants = [str(item) for item in (chat or {}).get("participants", [])]
+                if not chat or user_id not in participants or receiver_id not in participants or receiver_id == user_id:
+                    continue
+                if await is_blocked_between_users(db, user_id, receiver_id):
+                    continue
+                await manager.send_to(receiver_id, {
+                    "type": "call_signal",
+                    "chatId": chat_id,
+                    "fromUserId": user_id,
+                    "signalType": signal_type,
+                    "callType": call_type,
+                    "signal": signal if isinstance(signal, dict) else None,
+                })
+                continue
             if payload.get("type") == "typing":
                 receiver_id = str(payload.get("receiverId", "")).strip()
-                if receiver_id:
+                chat_id = str(payload.get("chatId", "")).strip()
+                try:
+                    chat = await db.chats.find_one({"_id": ObjectId(chat_id), "participants": user_id})
+                except Exception:
+                    chat = None
+                participants = [str(item) for item in (chat or {}).get("participants", [])]
+                if receiver_id in participants and receiver_id != user_id and not await is_blocked_between_users(db, user_id, receiver_id):
                     await manager.send_to(
                         receiver_id,
                         {
                             "type": "typing",
-                            "chatId": payload.get("chatId", ""),
+                            "chatId": chat_id,
                             "userId": user_id,
                             "isTyping": bool(payload.get("isTyping", False)),
                         },
@@ -447,19 +549,70 @@ async def chat_socket_alias(ws: WebSocket):
 @router.get("/rooms")
 async def get_chat_rooms(current_user=Depends(get_current_user)):
     db = get_db()
-    cursor = db.chats.find({"participants": current_user["id"], "task_id": {"$exists": True}}).sort("last_message_at", -1)
+    now = datetime.now(timezone.utc)
+    viewer = await db.users.find_one({"_id": ObjectId(current_user["id"])}, {"blocked_user_ids": 1}) or {}
+    blocked_by_me = {str(item) for item in viewer.get("blocked_user_ids", [])}
+    cursor = db.chats.find({"participants": current_user["id"], "$or": [{"context_type": "direct"}, {"task_id": {"$regex": "^dm_"}}, {"task_id": {"$exists": True}}], "hidden_for": {"$ne": current_user["id"]}}).sort("last_message_at", -1)
     rooms = []
     async for chat in cursor:
-        task = await db.tasks.find_one({"_id": parse_object_id(chat.get("task_id", ""), "Task not found")})
+        latest_message = await db.messages.find_one(
+            {
+                "chat_id": str(chat["_id"]),
+                "hidden_for": {"$ne": current_user["id"]},
+                "$or": [{"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
+            },
+            {"sender_id": 1, "status": 1, "text": 1, "message_type": 1, "is_deleted": 1, "deleted_for_everyone": 1, "created_at": 1},
+            sort=[("created_at", -1)],
+        )
+        last_message_sender_id = (latest_message or {}).get("sender_id", "")
+        last_message_status = (latest_message or {}).get("status", "sent")
+        last_message_id = str((latest_message or {}).get("_id", ""))
+        last_message = get_chat_preview_text(latest_message) if latest_message else ""
+        last_message_at = (latest_message or {}).get("created_at", chat.get("last_message_at", now))
+        task_id = str(chat.get("task_id", ""))
+        if chat.get("context_type") == "direct" or task_id.startswith("dm_"):
+            other_id = next((str(p) for p in chat.get("participants", []) if str(p) != current_user["id"]), "")
+            if not other_id:
+                continue
+            other_user = await db.users.find_one({"_id": ObjectId(other_id)}, {"name": 1, "avatar_url": 1, "avatar": 1, "uid": 1, "username": 1, "last_seen_at": 1, "blocked_user_ids": 1})
+            their_blocks = {str(item) for item in (other_user or {}).get("blocked_user_ids", [])}
+            if current_user["id"] in their_blocks:
+                continue
+            blocked = other_id in blocked_by_me
+            c = serialize_chat(chat); c["direct"] = True
+            c["blockedByMe"] = blocked
+            c["last_message_sender_id"] = last_message_sender_id
+            c["last_message_status"] = last_message_status
+            c["last_message_id"] = last_message_id
+            c["last_message"] = last_message
+            c["last_message_at"] = serialize_datetime(last_message_at)
+            c["muted"] = current_user["id"] in [str(item) for item in chat.get("muted_for", [])]
+            c["other_user"] = {"id": other_id, "name": (other_user or {}).get("name", "User"), "avatar_url": (other_user or {}).get("avatar_url") or (other_user or {}).get("avatar", ""), "uid": (other_user or {}).get("uid", ""), "username": (other_user or {}).get("username", ""), "isOnline": manager.is_online(other_id), "lastSeenAt": serialize_datetime((other_user or {}).get("last_seen_at"))}
+            c["unread_count"] = 0 if blocked else await db.messages.count_documents({"chat_id": c["id"], "sender_id": {"$ne": current_user["id"]}, "status": {"$in": ["sent", "delivered"]}, "hidden_for": {"$ne": current_user["id"]}, "$or": [{"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}]})
+            rooms.append(c)
+            continue
+        try:
+            task_object_id = ObjectId(task_id)
+        except InvalidId:
+            continue
+        task = await db.tasks.find_one({"_id": task_object_id})
         if not task or task.get("status") == "open" or current_user["id"] not in [task.get("created_by"), task.get("assigned_to")]:
             continue
         c = serialize_chat(chat)
+        c["last_message_sender_id"] = last_message_sender_id
+        c["last_message_status"] = last_message_status
+        c["last_message_id"] = last_message_id
+        c["last_message"] = last_message
+        c["last_message_at"] = serialize_datetime(last_message_at)
+        c["muted"] = current_user["id"] in [str(item) for item in chat.get("muted_for", [])]
         other_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task.get("created_by")
-        if await is_blocked_between_users(db, current_user["id"], other_id):
-            continue
         other_user = await db.users.find_one(
-            {"_id": ObjectId(other_id)}, {"name": 1, "avatar_url": 1, "uid": 1, "last_seen_at": 1}
+            {"_id": ObjectId(other_id)}, {"name": 1, "avatar_url": 1, "uid": 1, "last_seen_at": 1, "blocked_user_ids": 1}
         )
+        if current_user["id"] in {str(item) for item in (other_user or {}).get("blocked_user_ids", [])}:
+            continue
+        blocked = other_id in blocked_by_me
+        c["blockedByMe"] = blocked
         c["task"] = {
             "id": str(task["_id"]),
             "title": task.get("title", "Task"),
@@ -477,22 +630,115 @@ async def get_chat_rooms(current_user=Depends(get_current_user)):
                 "avatar_url": other_user.get("avatar_url", ""),
                 "uid": other_user.get("uid", ""),
                 "isOnline": manager.is_online(other_id),
-                "lastSeenAt": other_user.get("last_seen_at").isoformat()
-                if isinstance(other_user.get("last_seen_at"), datetime)
-                else other_user.get("last_seen_at"),
+                "lastSeenAt": serialize_datetime(other_user.get("last_seen_at")),
             }
-        c["message_count"] = await db.messages.count_documents(
-            {"chat_id": c["id"], "hidden_for": {"$ne": current_user["id"]}}
-        )
-        c["sent_message_count"] = await db.messages.count_documents(
+        c["unread_count"] = 0 if blocked else await db.messages.count_documents(
             {
                 "chat_id": c["id"],
-                "sender_id": current_user["id"],
+                "sender_id": {"$ne": current_user["id"]},
+                "status": {"$in": ["sent", "delivered"]},
                 "hidden_for": {"$ne": current_user["id"]},
+                "$or": [{"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
             }
         )
         rooms.append(c)
     return {"rooms": rooms}
+
+
+@router.get("/ice-servers")
+async def get_ice_servers(current_user=Depends(get_current_user)):
+    servers = [{"urls": "stun:stun.l.google.com:19302"}]
+    turn_urls = [url.strip() for url in os.getenv("TURN_URLS", "").split(",") if url.strip()]
+    if turn_urls:
+        turn_server = {"urls": turn_urls}
+        username = os.getenv("TURN_USERNAME", "").strip()
+        credential = os.getenv("TURN_CREDENTIAL", "").strip()
+        if username and credential:
+            turn_server.update({"username": username, "credential": credential})
+        servers.append(turn_server)
+    return {"iceServers": servers}
+
+
+@router.post("/direct/{user_id}")
+async def open_direct_chat(user_id: str, current_user=Depends(get_current_user)):
+    db = get_db(); target = parse_object_id(user_id, "User not found"); viewer = current_user["id"]
+    target_user = await db.users.find_one({"_id": target, "is_banned": {"$ne": True}}, {"name": 1, "blocked_user_ids": 1})
+    if not target_user: raise HTTPException(status_code=404, detail="User not found")
+    other_id = str(target)
+    if viewer == other_id: raise HTTPException(status_code=400, detail="You cannot message yourself")
+    await enforce_not_blocked(db, viewer, other_id)
+    participants = sorted([viewer, other_id]); key = "dm_" + "_".join(participants)
+    chat = await db.chats.find_one_and_update({"task_id": key}, {"$setOnInsert": {"task_id": key, "context_type": "direct", "participants": participants, "last_message": "", "last_message_at": datetime.now(timezone.utc), "created_at": datetime.now(timezone.utc), "updated_at": datetime.now(timezone.utc)}}, upsert=True, return_document=ReturnDocument.AFTER)
+    await db.chats.update_one({"_id": chat["_id"]}, {"$pull": {"hidden_for": viewer}})
+    return {"chat_id": str(chat["_id"])}
+
+
+@router.delete("/rooms/{chat_id}")
+async def hide_chat(chat_id: str, current_user=Depends(get_current_user)):
+    db = get_db(); chat = await db.chats.find_one({"_id": parse_object_id(chat_id), "participants": current_user["id"]})
+    if not chat: raise HTTPException(status_code=404, detail="Chat not found")
+    await db.chats.update_one({"_id": chat["_id"]}, {"$addToSet": {"hidden_for": current_user["id"]}})
+    return {"hidden": True}
+
+
+@router.patch("/rooms/{chat_id}/theme")
+async def update_chat_theme(chat_id: str, data: ChatThemeInput, current_user=Depends(get_current_user)):
+    chat = await get_db().chats.find_one_and_update({"_id": parse_object_id(chat_id), "participants": current_user["id"]}, {"$set": {"theme": data.theme, "updated_at": datetime.now(timezone.utc)}}, return_document=ReturnDocument.AFTER)
+    if not chat: raise HTTPException(status_code=404, detail="Chat not found")
+    return {"theme": chat.get("theme", "default")}
+
+
+@router.patch("/rooms/{chat_id}/mute")
+async def update_chat_mute(chat_id: str, data: ChatMuteInput, current_user=Depends(get_current_user)):
+    db = get_db()
+    chat = await db.chats.find_one({"_id": parse_object_id(chat_id), "participants": current_user["id"]})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    update = {"$addToSet": {"muted_for": current_user["id"]}} if data.muted else {"$pull": {"muted_for": current_user["id"]}}
+    await db.chats.update_one({"_id": chat["_id"]}, update)
+    return {"muted": data.muted}
+
+
+@router.patch("/rooms/{chat_id}/disappearing")
+async def update_disappearing_messages(chat_id: str, data: DisappearingMessagesInput, current_user=Depends(get_current_user)):
+    if data.seconds not in DISAPPEARING_DURATIONS:
+        raise HTTPException(status_code=400, detail="Choose off, 24 hours, 7 days, or 90 days")
+    chat = await get_db().chats.find_one_and_update(
+        {"_id": parse_object_id(chat_id), "participants": current_user["id"]},
+        {"$set": {"disappearing_seconds": data.seconds, "updated_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return {"seconds": int(chat.get("disappearing_seconds", 0) or 0)}
+
+
+@router.delete("/rooms/{chat_id}/messages")
+async def clear_chat_messages(chat_id: str, current_user=Depends(get_current_user)):
+    db = get_db()
+    chat = await db.chats.find_one({"_id": parse_object_id(chat_id), "participants": current_user["id"]})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    result = await db.messages.update_many(
+        {"chat_id": chat_id, "hidden_for": {"$ne": current_user["id"]}},
+        {"$addToSet": {"hidden_for": current_user["id"]}},
+    )
+    await manager.send_to(current_user["id"], {"type": "chat_cleared", "chatId": chat_id})
+    return {"cleared": result.modified_count}
+
+
+@router.post("/direct/{chat_id}/send")
+async def send_direct_message(chat_id: str, data: EditMessageInput, current_user=Depends(get_current_user)):
+    db = get_db(); chat = await db.chats.find_one({"_id": parse_object_id(chat_id), "context_type": "direct", "participants": current_user["id"]})
+    if not chat: raise HTTPException(status_code=404, detail="Conversation not found")
+    receiver = next((str(p) for p in chat.get("participants", []) if str(p) != current_user["id"]), "")
+    await enforce_not_blocked(db, current_user["id"], receiver)
+    text = data.text.strip()
+    if not text or len(text) > 5000: raise HTTPException(status_code=400, detail="Message must contain 1 to 5000 characters")
+    msg = await create_message(db, chat_id=str(chat["_id"]), task_id="", sender_id=current_user["id"], sender_name=current_user.get("name", "User"), receiver_id=receiver, text=text)
+    await broadcast_message_event(chat, "message_created", msg)
+    await db.chats.update_one({"_id": chat["_id"]}, {"$set": {"updated_at": datetime.now(timezone.utc)}, "$pull": {"hidden_for": current_user["id"]}})
+    return {"message": "Sent", "chat_id": str(chat["_id"]), "sent_message": serialize_message(msg, current_user["id"])}
 
 
 @router.get("/messages/{chat_id}")
@@ -501,20 +747,23 @@ async def get_messages(chat_id: str, page: int = 1, limit: int = 50, current_use
     chat = await db.chats.find_one({"_id": parse_object_id(chat_id)})
     if not chat or current_user["id"] not in [str(p) for p in chat.get("participants", [])]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    await load_task_for_chat(db, chat.get("task_id", ""), current_user["id"])
     participants = [str(participant) for participant in chat.get("participants", [])]
     other_user_id = next((participant for participant in participants if participant != current_user["id"]), "")
     if other_user_id:
         await enforce_not_blocked(db, current_user["id"], other_user_id)
+    if chat.get("context_type") != "direct":
+        await load_task_for_chat(db, chat.get("task_id", ""), current_user["id"])
 
     skip = (page - 1) * limit
     newly_seen = []
+    now = datetime.now(timezone.utc)
     async for message in db.messages.find(
         {
             "chat_id": chat_id,
             "sender_id": {"$ne": current_user["id"]},
             "status": {"$in": ["sent", "delivered"]},
             "hidden_for": {"$ne": current_user["id"]},
+            "$or": [{"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
         }, {"_id": 1, "sender_id": 1}
     ):
         newly_seen.append(message)
@@ -535,7 +784,11 @@ async def get_messages(chat_id: str, page: int = 1, limit: int = 50, current_use
         )
     # Return updated statuses so the opened conversation shows read receipts immediately.
     cursor = (
-        db.messages.find({"chat_id": chat_id, "hidden_for": {"$ne": current_user["id"]}})
+        db.messages.find({
+            "chat_id": chat_id,
+            "hidden_for": {"$ne": current_user["id"]},
+            "$or": [{"expires_at": {"$exists": False}}, {"expires_at": {"$gt": now}}],
+        })
         .sort("created_at", -1)
         .skip(skip)
         .limit(limit)
@@ -570,7 +823,8 @@ async def send_message(data: SendMessageInput, current_user=Depends(get_current_
 
 @router.post("/send-image")
 async def send_image_message(
-    task_id: str = Form(...),
+    task_id: Optional[str] = Form(None),
+    chat_id: Optional[str] = Form(None),
     image: Optional[UploadFile] = File(None),
     current_user=Depends(get_current_user),
 ):
@@ -581,7 +835,19 @@ async def send_image_message(
         raise HTTPException(status_code=400, detail="Only image files are allowed")
 
     db = get_db()
-    task = await load_task_for_chat(db, task_id, current_user["id"])
+    task = None
+    chat = None
+    if chat_id:
+        chat = await db.chats.find_one({"_id": parse_object_id(chat_id, "Conversation not found"), "context_type": "direct", "participants": current_user["id"]})
+        if not chat:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        receiver_id = next((str(participant) for participant in chat.get("participants", []) if str(participant) != current_user["id"]), "")
+    elif task_id:
+        task = await load_task_for_chat(db, task_id, current_user["id"])
+        receiver_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task["created_by"]
+    else:
+        raise HTTPException(status_code=400, detail="A conversation is required")
+    await enforce_not_blocked(db, current_user["id"], receiver_id)
     configure_cloudinary()
     try:
         image.file.seek(0)
@@ -592,18 +858,21 @@ async def send_image_message(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Task chat image upload failed for user_id=%s: %s", current_user["id"], exc)
+        logger.exception("Chat image upload failed for user_id=%s: %s", current_user["id"], exc)
         raise HTTPException(status_code=500, detail="Image upload failed") from exc
     finally:
         await image.close()
 
-    chat = await get_or_create_task_chat(db, task)
-    receiver_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task.get("created_by")
-    await enforce_not_blocked(db, current_user["id"], receiver_id)
+    if task:
+        chat = await get_or_create_task_chat(db, task)
+        receiver_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task["created_by"]
+        task_id_value = str(task["_id"])
+    else:
+        task_id_value = ""
     msg_doc = await create_message(
         db,
         chat_id=str(chat["_id"]),
-        task_id=str(task["_id"]),
+        task_id=task_id_value,
         sender_id=current_user["id"],
         sender_name=current_user["name"],
         receiver_id=receiver_id,
@@ -617,7 +886,8 @@ async def send_image_message(
 
 @router.post("/send-attachment")
 async def send_attachment_message(
-    task_id: str = Form(...),
+    task_id: Optional[str] = Form(None),
+    chat_id: Optional[str] = Form(None),
     attachment: Optional[UploadFile] = File(None),
     current_user=Depends(get_current_user),
 ):
@@ -625,7 +895,19 @@ async def send_attachment_message(
         raise HTTPException(status_code=400, detail="Attachment is required")
 
     db = get_db()
-    task = await load_task_for_chat(db, task_id, current_user["id"])
+    task = None
+    chat = None
+    if chat_id:
+        chat = await db.chats.find_one({"_id": parse_object_id(chat_id, "Conversation not found"), "context_type": "direct", "participants": current_user["id"]})
+        if not chat:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        receiver_id = next((str(participant) for participant in chat.get("participants", []) if str(participant) != current_user["id"]), "")
+    elif task_id:
+        task = await load_task_for_chat(db, task_id, current_user["id"])
+        receiver_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task["created_by"]
+    else:
+        raise HTTPException(status_code=400, detail="A conversation is required")
+    await enforce_not_blocked(db, current_user["id"], receiver_id)
     configure_cloudinary()
     try:
         attachment.file.seek(0)
@@ -646,14 +928,16 @@ async def send_attachment_message(
     finally:
         await attachment.close()
 
-    chat = await get_or_create_task_chat(db, task)
-    receiver_id = task["assigned_to"] if task.get("created_by") == current_user["id"] else task.get("created_by")
-    await enforce_not_blocked(db, current_user["id"], receiver_id)
+    if task:
+        chat = await get_or_create_task_chat(db, task)
+        task_id_value = str(task["_id"])
+    else:
+        task_id_value = ""
     message_type = "image" if (attachment.content_type or "").lower().startswith("image/") else "file"
     msg_doc = await create_message(
         db,
         chat_id=str(chat["_id"]),
-        task_id=str(task["_id"]),
+        task_id=task_id_value,
         sender_id=current_user["id"],
         sender_name=current_user["name"],
         receiver_id=receiver_id,
@@ -682,13 +966,19 @@ async def edit_message(message_id: str, data: EditMessageInput, current_user=Dep
         raise HTTPException(status_code=400, detail="Attachment messages cannot be edited")
     if message.get("message_type") == "file":
         raise HTTPException(status_code=400, detail="Attachment messages cannot be edited")
-    validate_task_message_text(data.text)
-    await load_task_for_chat(db, message.get("task_id", ""), current_user["id"])
     chat = await db.chats.find_one({"_id": parse_object_id(message["chat_id"], "Chat not found")})
     participants = [str(participant) for participant in (chat or {}).get("participants", [])]
+    if not chat or current_user["id"] not in participants:
+        raise HTTPException(status_code=403, detail="Not authorized")
     other_user_id = next((participant for participant in participants if participant != current_user["id"]), "")
     if other_user_id:
         await enforce_not_blocked(db, current_user["id"], other_user_id)
+    if chat.get("context_type") == "direct":
+        if not data.text.strip() or len(data.text.strip()) > 5000:
+            raise HTTPException(status_code=400, detail="Message must contain 1 to 5000 characters")
+    else:
+        await load_task_for_chat(db, message.get("task_id", ""), current_user["id"])
+        validate_task_message_text(data.text)
 
     updated_message = await db.messages.find_one_and_update(
         {"_id": parse_object_id(message_id, "Message not found")},
@@ -717,11 +1007,14 @@ async def delete_message(message_id: str, scope: str = "everyone", current_user=
     chat = await db.chats.find_one({"_id": parse_object_id(message["chat_id"], "Chat not found")})
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
-    await load_task_for_chat(db, message.get("task_id", ""), current_user["id"])
-
     participants = [str(participant) for participant in chat.get("participants", [])]
     if current_user["id"] not in participants:
         raise HTTPException(status_code=403, detail="Not authorized")
+    other_user_id = next((participant for participant in participants if participant != current_user["id"]), "")
+    if other_user_id:
+        await enforce_not_blocked(db, current_user["id"], other_user_id)
+    if chat.get("context_type") != "direct":
+        await load_task_for_chat(db, message.get("task_id", ""), current_user["id"])
     if scope == "me":
         await db.messages.update_one({"_id": object_id}, {"$addToSet": {"hidden_for": current_user["id"]}})
         await manager.send_to(current_user["id"], {"type": "message_hidden", "chatId": message["chat_id"], "messageId": message_id})
